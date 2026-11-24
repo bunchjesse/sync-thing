@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Testing
 @testable import SyncKit
@@ -74,12 +75,12 @@ struct SyncEngineTests {
         defer { directory.remove() }
         let studio = try TestMac(named: "studio", in: directory)
         let laptop = try TestMac(named: "laptop", in: directory)
-        try studio.write("original", to: "Notes/a.txt")
+        try studio.write("original", to: "Notes/a.txt", modified: ago(60))
         try await studio.engine.addItem(at: studio.url("Notes"))
         try await laptop.pull(from: studio)
 
-        try studio.write("older edit", to: "Notes/a.txt", modified: .now.addingTimeInterval(10))
-        try laptop.write("newer edit", to: "Notes/a.txt", modified: .now.addingTimeInterval(20))
+        try studio.write("older edit", to: "Notes/a.txt", modified: ago(30))
+        try laptop.write("newer edit", to: "Notes/a.txt", modified: ago(10))
         await studio.engine.rescanAll()
         await laptop.engine.rescanAll()
         try await laptop.pull(from: studio)
@@ -370,22 +371,5 @@ struct SyncEngineTests {
 
         #expect(report.deleted == 0)
         #expect(laptop.read("Notes/Private/a.txt") == "x")
-    }
-}
-
-/// A peer that serves a fixed item list and index, with nothing to
-/// download.
-struct FixedPeer: SyncPeer {
-    /// The item list to serve.
-    var items: [SyncItem]
-    /// The index served for every item.
-    var records: [FileRecord] = []
-
-    func items() async throws -> [SyncItem] { items }
-
-    func records(forItem itemID: String) async throws -> [FileRecord]? { records }
-
-    func download(itemID: String, path: String, to destination: URL) async throws {
-        throw URLError(.fileDoesNotExist)
     }
 }

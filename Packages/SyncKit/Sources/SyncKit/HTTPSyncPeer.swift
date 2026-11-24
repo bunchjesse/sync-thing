@@ -48,7 +48,7 @@ struct HTTPSyncPeer: SyncPeer {
         let (location, response) = try await session.download(for: request(path: "v1/file", query: ["item": itemID, "path": path]))
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             try? FileManager.default.removeItem(at: location)
-            throw URLError(.badServerResponse)
+            throw Self.error(for: response)
         }
         try FileManager.default.moveItem(at: location, to: destination)
     }
@@ -83,9 +83,16 @@ struct HTTPSyncPeer: SyncPeer {
     private func send(_ request: URLRequest, allowing allowed: Set<Int> = []) async throws -> (Data, HTTPURLResponse) {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) || allowed.contains(http.statusCode) else {
-            throw URLError(.badServerResponse)
+            throw Self.error(for: response)
         }
         return (data, http)
+    }
+
+    /// The error for an unsuccessful `response`: one saying the token was
+    /// turned away — the peer revoked it, which ends the pull — or a bad
+    /// response.
+    private static func error(for response: URLResponse) -> URLError {
+        (response as? HTTPURLResponse)?.statusCode == 401 ? URLError(.userAuthenticationRequired) : URLError(.badServerResponse)
     }
 }
 

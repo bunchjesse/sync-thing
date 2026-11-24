@@ -25,23 +25,39 @@ they're on different networks.
   minute. Changes on disk are picked up with FSEvents, plus a full rescan at
   launch, on wake, and every ten minutes.
 - **Conflicts**: newest wins, silently. Each file's version is its
-  modification time, and a file that replaces an older record always goes
-  after it. Ties break the same way on every Mac. Timestamps more than a week
-  ahead of this Mac's clock are ignored.
-- **Deletions**: deleted files go to the Trash (or are removed outright on a
-  volume without one); a folder is removed only once it's empty. Deletions are
-  remembered as tombstones for 90 days; a Mac away longer than that may bring
-  a deleted file back.
+  modification time, capped at the scan's time so a file stamped in the future
+  can't outrank every later edit, and a file that replaces an older record
+  always goes after it. Ties break the same way on every Mac. Versions more
+  than a week ahead of this Mac's clock are ignored. A file whose contents
+  already match the winner is adopted without a download; one that was only
+  touched keeps its version.
+- **Deletions**: a deletion is dated by its folder's modification time — when
+  the entry went — not by when a scan noticed, so an edit made elsewhere in
+  the meantime still wins. Deleted files go to the Trash (or are removed
+  outright on a volume without one); a folder is removed only once it's
+  empty, and one holding files outranks a peer that replaced it with a file.
+  Deletions are remembered as tombstones for 90 days; a Mac away longer than
+  that may bring a deleted file back.
+- **A Mac joining** pulls the item list from each Mac it connects to and
+  creates any missing folder. What it already has is merged by the same
+  rules: matching files are adopted, the newer copy wins — an older copy here
+  is overwritten, not trashed — and its own files reach the others on their
+  next pull. A pull that's interrupted resumes where it left off.
 - **Safety**: an item whose folder is missing on a Mac — an unmounted drive —
-  pauses there instead of deleting the files everywhere, and a folder or file
-  that can't be read keeps its records rather than looking deleted. A file
-  changed on this Mac since its last scan is never overwritten by a pull.
-  Pulls never write, and the server never reads, through a symbolic link
-  inside an item.
+  or whose single file became a folder or a link pauses there instead of
+  deleting the files everywhere, and a folder or file that can't be read keeps
+  its records rather than looking deleted. A file changed on this Mac since
+  its last scan is never overwritten by a pull. Pulls never write, and the
+  server never reads, through a symbolic link inside an item; a file or
+  folder replaced by a link keeps its records. Two names that differ only in
+  case can't both live on a case-insensitive disk, so the second one is
+  reported as failed rather than overwriting the first. A peer's token is
+  revoked when its tunnel closes, which ends any pull in progress.
 - **The list of items syncs too.** Adding or removing an item on one Mac does so
   on all of them; removing one leaves its files in place. A Mac ignores an
   item from a peer that it wouldn't accept from its own user, such as one
-  overlapping an item it already syncs.
+  overlapping an item it already syncs, or one it would name differently
+  (another case, or a path through a link).
 
 Paths in the home folder are portable (`~/Documents/Notes`), so Macs with
 different user names agree. Symbolic links, permissions, and extended

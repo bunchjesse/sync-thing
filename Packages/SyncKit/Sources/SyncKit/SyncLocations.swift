@@ -35,21 +35,19 @@ public struct SyncLocations: Sendable, Hashable {
         self.home = home.standardizedFileURL.resolvingSymlinksInPath()
     }
 
-    /// The portable path for `url`.
+    /// The portable path for `url`, judged by where it really leads
+    /// (``realPath(_:)``), so every spelling of a place — through a link, in
+    /// another case — gets the same one.
     public func portablePath(for url: URL) -> String {
-        let path = Self.trimmingTrailingSlash(url.standardizedFileURL.resolvingSymlinksInPath().path(percentEncoded: false))
-        let trimmedHome = Self.trimmingTrailingSlash(home.path(percentEncoded: false))
-        if path == trimmedHome {
+        let path = Self.realPath(url.standardizedFileURL)
+        let home = Self.realPath(home)
+        if path == home {
             return "~"
         }
-        if path.hasPrefix(trimmedHome + "/") {
-            return "~/" + path.dropFirst(trimmedHome.count + 1)
+        if path.hasPrefix(home + "/") {
+            return "~/" + path.dropFirst(home.count + 1)
         }
         return path
-    }
-
-    private static func trimmingTrailingSlash(_ path: String) -> String {
-        path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
     }
 
     /// The URL a portable path stands for on this Mac.
@@ -61,5 +59,20 @@ public struct SyncLocations: Sendable, Hashable {
             return home.appending(path: String(portablePath.dropFirst(2)))
         }
         return URL(filePath: portablePath)
+    }
+
+    /// Where `url` really leads, as the file system names it: every symbolic
+    /// link resolved — including `/tmp` and `/var` — and every name in the
+    /// case it has on disk. A path that doesn't exist yet resolves as far as
+    /// its existing parent does.
+    static func realPath(_ url: URL) -> String {
+        let path = url.path(percentEncoded: false)
+        if let resolved = realpath(path, nil) {
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+        let parent = url.deletingLastPathComponent()
+        guard parent.path(percentEncoded: false) != path else { return path }
+        return (realPath(parent) as NSString).appendingPathComponent(url.lastPathComponent)
     }
 }

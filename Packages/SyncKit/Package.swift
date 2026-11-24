@@ -23,7 +23,10 @@ let package = Package(
         ),
         .testTarget(
             name: "SyncKitTests",
-            dependencies: ["SyncKit"]
+            dependencies: [
+                "SyncKit",
+                .product(name: "Hummingbird", package: "hummingbird"),
+            ]
         ),
     ]
 )

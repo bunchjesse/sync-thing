@@ -27,13 +27,21 @@ the Macs on one Apple Account. See `README.md` for the design.
 - Test SyncKit with `swift test --package-path Packages/SyncKit`. Tests use
   Swift Testing, and every test has a `///` comment saying what it checks.
 - Engine tests run several `SyncEngine`s in temporary directories against each
-  other through `EnginePeer`; add new sync behavior tests there.
+  other through `EnginePeer` (`TestSupport.swift`; `FaultyPeer` injects
+  failures). Suites are split by scenario: `NewMacTests`, `ConflictTests`,
+  `ItemTests`, `DegenerateInputTests`, `FailureTests`; add new sync behavior
+  tests to the matching one.
+- Use `ago(_:)` for test modification times: versions are capped at now, so a
+  future time doesn't win.
 
 ## Rules
 
 - Never let a pull delete files because something is missing locally: a missing
   item root pauses the item (`FileScanner.Outcome.rootMissing`), and a path the
-  scanner can't read keeps its previous records.
+  scanner can't read — or that is a symbolic link — keeps its previous
+  records.
+- Compare and name paths by `SyncLocations.realPath`/`portablePath`, which
+  resolve links, `/private`, and case, never by the spelling given.
 - Every path a peer sends goes through `SyncEngine.isSafe(path:in:)` or
   `isSafeItemID` before touching disk, every write and read goes through
   `hasNoLinks(below:to:includingTarget:)`, and every peer timestamp through

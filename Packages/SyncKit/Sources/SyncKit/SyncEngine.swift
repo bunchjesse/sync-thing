@@ -115,7 +115,7 @@ public actor SyncEngine {
     /// path can't be synced.
     @discardableResult
     public func addItem(at url: URL) async throws -> SyncItem {
-        let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
+        let resolved = URL(filePath: SyncLocations.realPath(url.standardizedFileURL))
         let path = resolved.path(percentEncoded: false)
         guard FileManager.default.fileExists(atPath: path) else { throw SyncError.notFound(path) }
         let id = locations.portablePath(for: resolved)
@@ -148,21 +148,25 @@ public actor SyncEngine {
     /// Why `id` can't be synced on this Mac, or nil when it can: it must not
     /// be the home folder, the root, a volume, or a folder holding the home
     /// folder or this engine's own state, and it must not overlap another
-    /// active item.
+    /// active item. Every rule is judged by where the path really leads, so
+    /// a symbolic link or a name that differs only in case can't get around
+    /// one.
     private func admissionProblem(for id: String) -> SyncError? {
-        let path = url(forPortablePath: id).path(percentEncoded: false)
-        let isVolume = (try? url(forPortablePath: id).resourceValues(forKeys: [.isVolumeKey]))?.isVolume == true
-        let home = locations.home.path(percentEncoded: false)
-        if id == "~" || path == "/" || isVolume || Self.isSameOrInside(home, path) {
+        let url = url(forPortablePath: id)
+        let realPath = SyncLocations.realPath(url)
+        let isVolume = (try? URL(filePath: realPath).resourceValues(forKeys: [.isVolumeKey]))?.isVolume == true
+        let home = SyncLocations.realPath(locations.home)
+        if id == "~" || realPath == "/" || isVolume || Self.isSameOrInside(home, realPath) {
             return .tooBroad(id)
         }
-        let state = store.directory.standardizedFileURL.resolvingSymlinksInPath().path(percentEncoded: false)
-        if Self.isSameOrInside(state, path) || Self.isSameOrInside(path, state) {
+        let state = SyncLocations.realPath(store.directory)
+        if Self.isSameOrInside(state, realPath) || Self.isSameOrInside(realPath, state) {
             return .reserved(id)
         }
         for other in activeItems() where other.id != id {
-            if Self.isSameOrInside(id, other.id) { return .insideSyncedItem(parent: other.id) }
-            if Self.isSameOrInside(other.id, id) { return .containsSyncedItem(child: other.id) }
+            let otherPath = SyncLocations.realPath(self.url(for: other))
+            if Self.isSameOrInside(realPath, otherPath) { return .insideSyncedItem(parent: other.id) }
+            if Self.isSameOrInside(otherPath, realPath) { return .containsSyncedItem(child: other.id) }
         }
         return nil
     }
@@ -171,26 +175,44 @@ public actor SyncEngine {
         locations.url(forPortablePath: id)
     }
 
+    /// The portable path this Mac gives the place `id` leads to.
+    private nonisolated func canonicalID(for id: String) -> String {
+        locations.portablePath(for: url(forPortablePath: id))
+    }
+
     /// Adopts every entry in a peer's item list that is newer than this
     /// Mac's. Returns the items that became active here. An entry this Mac
-    /// wouldn't accept from its own user — too broad, or overlapping an item
-    /// already synced — is ignored.
+    /// wouldn't accept from its own user (``admissionProblem(for:)``) is
+    /// ignored, as is one this Mac would name differently — an absolute
+    /// path into the home folder, a name in another case, or a path through
+    /// a symbolic link — and one that would turn an active folder into a
+    /// file or the other way round.
     private func mergeItems(_ remote: [SyncItem]) -> [SyncItem] {
         var added: [SyncItem] = []
         var changed = false
         let now = Date().syncTimestamp
         for item in remote where Self.isSafeItemID(item.id) && Self.isPlausible(item.version, now: now) {
             if let current = items[item.id], !item.supersedes(current) { continue }
-            let wasActive = items[item.id].map { !$0.isRemoved } ?? false
-            if !item.isRemoved, !wasActive, let problem = admissionProblem(for: item.id) {
-                Self.log.error("Ignoring \(item.id, privacy: .private) from a peer: \(problem.localizedDescription, privacy: .private)")
-                continue
+            let current = items[item.id].flatMap { $0.isRemoved ? nil : $0 }
+            if !item.isRemoved {
+                if let current, current.kind != item.kind {
+                    Self.log.error("Ignoring \(item.id, privacy: .private) from a peer: it's a \(item.kind.rawValue, privacy: .public) there")
+                    continue
+                }
+                if current == nil, canonicalID(for: item.id) != item.id {
+                    Self.log.error("Ignoring \(item.id, privacy: .private) from a peer: this Mac names it \(self.canonicalID(for: item.id), privacy: .private)")
+                    continue
+                }
+                if current == nil, let problem = admissionProblem(for: item.id) {
+                    Self.log.error("Ignoring \(item.id, privacy: .private) from a peer: \(problem.localizedDescription, privacy: .private)")
+                    continue
+                }
             }
             items[item.id] = item
             changed = true
             if item.isRemoved {
                 forgetIndex(item.id)
-            } else if !wasActive {
+            } else if current == nil {
                 createRootIfNew(item)
                 added.append(item)
             }
@@ -251,7 +273,9 @@ public actor SyncEngine {
         var changed = false
         repeat {
             rescanRequested.remove(itemID)
-            let previous = indexes[itemID] ?? [:]
+            // An item that comes back after this Mac lost its item list
+            // still has its saved index, tombstones and all.
+            let previous = indexes[itemID] ?? store.loadIndex(itemID: itemID) ?? [:]
             let generation = generations[itemID, default: 0]
             let root = url(for: item)
             let now = Date().syncTimestamp
@@ -345,10 +369,11 @@ public actor SyncEngine {
     /// One change a pull will make, and the local record it was planned
     /// against.
     private struct Action {
-        /// What the change does. Actions run in this order, so directories
-        /// exist before files land in them.
+        /// What the change does. Actions run in this order: deletions clear
+        /// the way for a folder that becomes a file and for a name whose
+        /// case changed, and directories exist before files land in them.
         enum Kind: Int, Comparable {
-            case createDirectory, download, adopt, deleteFile, deleteDirectory
+            case deleteFile, deleteDirectory, createDirectory, download, adopt
             static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
         }
 
@@ -370,6 +395,8 @@ public actor SyncEngine {
         /// A directory the peer deleted was kept, because this Mac still
         /// has files in it.
         case keptDirectory
+        /// The index took the change, but the disk was left alone.
+        case recorded
     }
 
     /// Pulls `item` from `peer`, whose index of it is `records`, adding
@@ -394,6 +421,11 @@ public actor SyncEngine {
             try Task.checkCancellation()
             var download: URL?
             if action.kind == .download {
+                guard Self.hasNoLinks(below: url(for: item), to: fileURL(in: item, path: action.remote.path), includingTarget: true) else {
+                    Self.log.error("Not downloading \(action.remote.path, privacy: .private): a symbolic link is in the way")
+                    report.failed += 1
+                    continue
+                }
                 do {
                     let directory = try staging ?? stagingDirectory(for: item)
                     staging = directory
@@ -416,7 +448,7 @@ public actor SyncEngine {
             }
             do {
                 switch try apply(action, to: item, download: download) {
-                case .skipped, .keptDirectory:
+                case .skipped, .keptDirectory, .recorded:
                     break
                 case .done:
                     switch action.kind {
@@ -440,13 +472,16 @@ public actor SyncEngine {
 
     /// The changes that bring `item` up to date with a peer's `remote`
     /// records, in the order they must happen. Records with impossible
-    /// paths, sizes, or timestamps are ignored.
+    /// paths, sizes, or timestamps are ignored, as are tombstones this Mac
+    /// has already pruned or would prune.
     private func plan(_ item: SyncItem, remote: [FileRecord]) -> [Action] {
         let local = indexes[item.id] ?? [:]
         let now = Date().syncTimestamp
         var actions: [Action] = []
         for record in remote where Self.isSafe(path: record.path, in: item) && Self.isPlausible(record, now: now) {
             let current = local[record.path]
+            let isExpired = record.isDeleted && now - record.version >= FileScanner.tombstoneLifetime
+            if isExpired, current == nil || current?.isDeleted == true { continue }
             if let current, current.hasSameContent(as: record) {
                 if record.supersedes(current) {
                     actions.append(Action(kind: .adopt, remote: record, expected: current))
@@ -475,22 +510,38 @@ public actor SyncEngine {
     /// Makes one planned change on disk and in the index. Changes nothing
     /// when the path changed since the plan was made — in the index, or on
     /// disk ahead of the next scan, which is then asked for so the change
-    /// reaches the peers instead of being overwritten. Throws, changing
-    /// nothing, when a folder on the way to the path is a symbolic link,
-    /// which would lead outside the item.
+    /// reaches the peers instead of being overwritten.
+    ///
+    /// Symbolic links aren't synced and would lead outside the item, so when
+    /// the path or a folder on the way is one, a deletion is only recorded
+    /// and anything else throws. A path that, or a folder on the way that,
+    /// differs only in case from an indexed one throws too.
     private func apply(_ action: Action, to item: SyncItem, download: URL?) throws -> Applied {
         guard items[item.id]?.isRemoved == false, !missingRoots.contains(item.id), var index = indexes[item.id] else { return .skipped }
         let path = action.remote.path
         guard index[path] == action.expected else { return .skipped }
         let root = url(for: item)
         let url = fileURL(in: item, path: path)
-        guard Self.hasNoLinks(below: root, to: url, includingTarget: false) else {
-            throw CocoaError(.fileWriteNoPermission, userInfo: [NSFilePathErrorKey: url.path(percentEncoded: false)])
+        guard Self.hasNoLinks(below: root, to: url, includingTarget: true) else {
+            guard action.kind == .deleteFile || action.kind == .deleteDirectory else {
+                throw CocoaError(.fileWriteNoPermission, userInfo: [NSFilePathErrorKey: url.path(percentEncoded: false)])
+            }
+            index[path] = action.remote
+            indexes[item.id] = index
+            generations[item.id, default: 0] += 1
+            dirtyIndexes.insert(item.id)
+            return .recorded
         }
         guard Self.disk(at: url, matches: action.expected) else {
+            if action.expected == nil, Self.caseClash(for: path, in: index) {
+                throw CocoaError(.fileWriteFileExists, userInfo: [NSFilePathErrorKey: url.path(percentEncoded: false)])
+            }
             rescanRequested.insert(item.id)
             Task { await rescan(itemID: item.id) }
             return .skipped
+        }
+        if Self.caseClash(for: path, in: index, ancestorsOnly: true) {
+            throw CocoaError(.fileWriteFileExists, userInfo: [NSFilePathErrorKey: url.path(percentEncoded: false)])
         }
 
         var record = action.remote
@@ -498,7 +549,7 @@ public actor SyncEngine {
         switch action.kind {
         case .adopt:
             if record.kind == .file, !record.isDeleted {
-                record.modified = try Self.setModified(record.modified, of: url)
+                (record.modified, record.size) = try Self.setModified(record.modified, of: url)
             }
         case .createDirectory:
             if action.expected?.kind == .file, action.expected?.isDeleted == false {
@@ -508,7 +559,13 @@ public actor SyncEngine {
         case .download:
             guard let download else { return .skipped }
             if action.expected?.kind == .directory, action.expected?.isDeleted == false {
-                guard Self.isEffectivelyEmpty(url) else { return .skipped }
+                guard Self.isEffectivelyEmpty(url) else {
+                    // The peer made a file of a folder this Mac still has
+                    // files in; the folder stays, and goes back to the peer.
+                    record = FileRecord(path: path, kind: .directory, version: Self.nextVersion(after: record.version), modified: Date().syncTimestamp)
+                    applied = .keptDirectory
+                    break
+                }
                 try FileManager.default.removeItem(at: url)
             }
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -517,7 +574,7 @@ public actor SyncEngine {
             } else {
                 try FileManager.default.moveItem(at: download, to: url)
             }
-            record.modified = try Self.setModified(record.modified, of: url)
+            (record.modified, record.size) = try Self.setModified(record.modified, of: url)
         case .deleteFile:
             try removeFile(url)
         case .deleteDirectory:
@@ -574,7 +631,7 @@ public actor SyncEngine {
     static func isSafe(path: String, in item: SyncItem) -> Bool {
         if item.kind == .file { return path.isEmpty }
         let components = path.split(separator: "/", omittingEmptySubsequences: false)
-        return !path.isEmpty && components.allSatisfy { component in
+        return !path.isEmpty && !hasControlCharacters(path) && components.allSatisfy { component in
             !component.isEmpty && component != "." && component != ".." && !FileScanner.isIgnored(String(component))
         }
     }
@@ -584,9 +641,33 @@ public actor SyncEngine {
     /// components, and no trailing slash.
     static func isSafeItemID(_ id: String) -> Bool {
         let prefix = id.hasPrefix("~/") ? "~/" : id.hasPrefix("/") ? "/" : nil
-        guard let prefix else { return false }
+        guard let prefix, !hasControlCharacters(id) else { return false }
         let components = id.dropFirst(prefix.count).split(separator: "/", omittingEmptySubsequences: false)
         return components.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
+    }
+
+    /// Whether `path`, or with `ancestorsOnly` one of its folders, is spelled
+    /// differently only in case from a live entry in `index` — two names a
+    /// case-insensitive disk would put in one place. A folder already
+    /// indexed under this spelling is taken as is, so a pull's usual
+    /// actions don't search the index.
+    private static func caseClash(for path: String, in index: [String: FileRecord], ancestorsOnly: Bool = false) -> Bool {
+        let components = path.split(separator: "/")
+        let count = ancestorsOnly ? components.count - 1 : components.count
+        guard count > 0 else { return false }
+        return (1...count).contains { length in
+            let prefix = components.prefix(length).joined(separator: "/")
+            if let record = index[prefix], !record.isDeleted, length < components.count { return false }
+            return index.contains { entry in
+                entry.key != prefix && !entry.value.isDeleted && entry.key.caseInsensitiveCompare(prefix) == .orderedSame
+            }
+        }
+    }
+
+    /// Whether `path` contains a control character. Some file APIs cut a
+    /// path at a NUL and others don't, so one name could stand for two.
+    private static func hasControlCharacters(_ path: String) -> Bool {
+        path.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) && $0 != "\n" && $0 != "\t" }
     }
 
     /// How far ahead of this Mac's clock a peer's timestamps may run.
@@ -599,10 +680,11 @@ public actor SyncEngine {
         timestamp >= 0 && timestamp <= now + maximumClockSkew
     }
 
-    /// Whether a peer's `record` has a plausible version, modification time,
-    /// and size.
+    /// Whether a peer's `record` has a plausible version and size. Its
+    /// modification time can be anything a file system allows, including
+    /// before 1970.
     static func isPlausible(_ record: FileRecord, now: SyncTimestamp) -> Bool {
-        isPlausible(record.version, now: now) && isPlausible(record.modified, now: now) && record.size >= 0
+        isPlausible(record.version, now: now) && record.size >= 0
     }
 
     /// Whether `path` is `ancestor` or inside it.
@@ -611,22 +693,36 @@ public actor SyncEngine {
     }
 
     /// Whether every folder between `root` and `url` is a real folder or
-    /// doesn't exist yet, and, with `includingTarget`, `url` itself isn't a
-    /// symbolic link. A link anywhere below the root would lead a write,
-    /// a deletion, or a download outside the item.
+    /// doesn't exist yet, and, with `includingTarget`, `url` itself — even
+    /// when it's `root` — isn't a symbolic link. A link anywhere below the
+    /// root would lead a write, a deletion, or a download outside the item.
     static func hasNoLinks(below root: URL, to url: URL, includingTarget: Bool) -> Bool {
-        let rootComponents = root.standardizedFileURL.pathComponents
+        let rootURL = root.standardizedFileURL
+        let rootComponents = rootURL.pathComponents
         let components = url.standardizedFileURL.pathComponents
         guard components.count >= rootComponents.count, Array(components.prefix(rootComponents.count)) == rootComponents else { return false }
-        var current = root.standardizedFileURL
+        if components.count == rootComponents.count {
+            return !includingTarget || !isSymbolicLink(rootURL)
+        }
+        var current = rootURL
         let last = includingTarget ? components.count : components.count - 1
-        for index in rootComponents.count..<max(last, rootComponents.count) {
+        for index in rootComponents.count..<last {
             current = current.appending(path: components[index])
-            var info = stat()
-            guard lstat(current.path(percentEncoded: false), &info) == 0 else { return true }
-            if info.st_mode & S_IFMT == S_IFLNK { return false }
+            if isSymbolicLink(current) { return false }
         }
         return true
+    }
+
+    /// Whether `url` is a symbolic link; false when nothing is there. The
+    /// path is checked without a trailing slash, which would make `lstat`
+    /// follow the link.
+    private static func isSymbolicLink(_ url: URL) -> Bool {
+        var path = url.path(percentEncoded: false)
+        while path.count > 1, path.hasSuffix("/") {
+            path.removeLast()
+        }
+        var info = stat()
+        return lstat(path, &info) == 0 && info.st_mode & S_IFMT == S_IFLNK
     }
 
     /// Whether the disk at `url` still holds what `record` says it does.
@@ -648,10 +744,13 @@ public actor SyncEngine {
     }
 
     /// Sets `url`'s modification time to `modified` and returns the time the
-    /// file system kept.
-    private static func setModified(_ modified: SyncTimestamp, of url: URL) throws -> SyncTimestamp {
+    /// file system kept, with the file's size.
+    private static func setModified(_ modified: SyncTimestamp, of url: URL) throws -> (modified: SyncTimestamp, size: Int64) {
         try FileManager.default.setAttributes([.modificationDate: Date(syncTimestamp: modified)], ofItemAtPath: url.path(percentEncoded: false))
-        return (try url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? .now).syncTimestamp
+        var url = url
+        url.removeAllCachedResourceValues()
+        let values = try url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        return ((values.contentModificationDate ?? .now).syncTimestamp, Int64(values.fileSize ?? 0))
     }
 
     /// Whether the directory at `url` holds nothing but names that are never
@@ -661,12 +760,12 @@ public actor SyncEngine {
         return contents.allSatisfy(FileScanner.isIgnored)
     }
 
-    /// Whether `error` means the peer is gone, which ends a pull, rather
-    /// than one path failing.
+    /// Whether `error` means the peer is gone, or no longer accepts this
+    /// Mac's token, which ends a pull, rather than one path failing.
     private static func isConnectionFailure(_ error: any Error) -> Bool {
         if error is CancellationError { return true }
         guard let urlError = error as? URLError else { return false }
-        return [.cannotConnectToHost, .cannotFindHost, .networkConnectionLost, .notConnectedToInternet, .timedOut, .cancelled].contains(urlError.code)
+        return [.cannotConnectToHost, .cannotFindHost, .networkConnectionLost, .notConnectedToInternet, .timedOut, .cancelled, .userAuthenticationRequired].contains(urlError.code)
     }
 
     /// Runs blocking file-system work on the engine's queue.

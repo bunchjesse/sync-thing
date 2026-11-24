@@ -55,7 +55,7 @@ final class FileWatcher: Sendable {
 
     /// Watches `items` instead of whatever was watched before.
     func watch(_ items: [(id: String, url: URL, isFile: Bool)]) {
-        let roots = Dictionary(items.map { ($0.id, Root(path: Self.realPath($0.url), isFile: $0.isFile)) }, uniquingKeysWith: { first, _ in first })
+        let roots = Dictionary(items.map { ($0.id, Root(path: SyncLocations.realPath($0.url), isFile: $0.isFile)) }, uniquingKeysWith: { first, _ in first })
         let unchanged = state.withLock { $0.stream != nil && $0.roots == roots }
         guard !unchanged else { return }
         stopStream()
@@ -116,20 +116,6 @@ final class FileWatcher: Sendable {
         FSEventStreamStop(stream)
         FSEventStreamInvalidate(stream)
         FSEventStreamRelease(stream)
-    }
-
-    /// `url`'s path as FSEvents reports it, with every symbolic link —
-    /// including `/tmp` and `/var` — resolved. A path that doesn't exist yet
-    /// resolves as far as its existing parent does.
-    static func realPath(_ url: URL) -> String {
-        let path = url.path(percentEncoded: false)
-        if let resolved = realpath(path, nil) {
-            defer { free(resolved) }
-            return String(cString: resolved)
-        }
-        let parent = url.deletingLastPathComponent()
-        guard parent.path(percentEncoded: false) != path else { return path }
-        return (realPath(parent) as NSString).appendingPathComponent(url.lastPathComponent)
     }
 
     /// Maps changed `paths` to the items in `target` they belong to.

@@ -14,9 +14,10 @@ enum FileScanner {
         /// The item's records, keyed by path.
         case scanned([String: FileRecord])
         /// The item's root isn't there to scan — a folder that doesn't exist,
-        /// or a file whose folder doesn't — so nothing can be said about its
-        /// contents. Reporting that instead of a deletion of everything is
-        /// what keeps an unmounted drive from emptying the item on every Mac.
+        /// or a file whose folder doesn't exist or that became a folder or a
+        /// symbolic link — so nothing can be said about its contents.
+        /// Reporting that instead of a deletion of everything is what keeps
+        /// an unmounted drive from emptying the item on every Mac.
         case rootMissing
     }
 
@@ -34,12 +35,15 @@ enum FileScanner {
     }
 
     /// Scans `root`, an item of `kind`, against its `previous` records.
-    /// `now` stamps tombstones and directories that replace older records.
+    /// `now` caps versions, so a file stamped in the future can't outrank
+    /// every later change, and is the latest a deletion can be dated.
     ///
-    /// A path the scan can't read — a folder macOS won't list, a file whose
-    /// attributes can't be read — keeps its previous records, as does
-    /// everything under it, so a permission change never looks like a
-    /// deletion.
+    /// A path the scan can't vouch for keeps its previous records, as does
+    /// everything under it, so it never looks like a deletion: a folder
+    /// macOS won't list, a file whose attributes can't be read, or a path
+    /// that became a symbolic link, which isn't synced. A deletion is dated
+    /// by its folder's modification time, which is when the folder last
+    /// lost an entry, rather than by when the scan noticed it.
     static func scan(
         root: URL,
         kind: SyncItem.Kind,
@@ -47,7 +51,7 @@ enum FileScanner {
         now: SyncTimestamp
     ) -> Outcome {
         var found: [String: FileRecord] = [:]
-        var unreadable: [String] = []
+        var unknown: [String] = []
         switch kind {
         case .folder:
             guard isDirectory(root), (try? FileManager.default.contentsOfDirectory(atPath: root.path(percentEncoded: false))) != nil else {
@@ -57,25 +61,22 @@ enum FileScanner {
             while let directory = pending.popLast() {
                 let directoryURL = directory.isEmpty ? root : root.appending(path: directory, directoryHint: .isDirectory)
                 guard let names = try? FileManager.default.contentsOfDirectory(atPath: directoryURL.path(percentEncoded: false)) else {
-                    unreadable.append(directory)
+                    unknown.append(directory)
                     continue
                 }
                 for name in names where !isIgnored(name) {
                     let path = directory.isEmpty ? name : directory + "/" + name
                     let url = root.appending(path: path)
-                    guard let values = try? url.resourceValues(forKeys: scanKeys) else {
-                        unreadable.append(path)
-                        continue
-                    }
-                    if values.isSymbolicLink == true {
+                    guard let values = try? url.resourceValues(forKeys: scanKeys), values.isSymbolicLink != true else {
+                        unknown.append(path)
                         continue
                     }
                     if values.isDirectory == true {
                         found[path] = directoryRecord(path: path, url: url, previous: previous[path], now: now)
                         pending.append(path)
                     } else if values.isRegularFile == true {
-                        guard let record = fileRecord(path: path, url: url, values: values, previous: previous[path]) else {
-                            unreadable.append(path)
+                        guard let record = fileRecord(path: path, url: url, values: values, previous: previous[path], now: now) else {
+                            unknown.append(path)
                             continue
                         }
                         found[path] = record
@@ -84,24 +85,29 @@ enum FileScanner {
             }
         case .file:
             guard isDirectory(root.deletingLastPathComponent()) else { return .rootMissing }
+            var root = root
+            root.removeAllCachedResourceValues()
             if let values = try? root.resourceValues(forKeys: scanKeys) {
-                if values.isRegularFile == true, values.isSymbolicLink != true {
-                    if let record = fileRecord(path: "", url: root, values: values, previous: previous[""]) {
-                        found[""] = record
-                    } else {
-                        unreadable.append("")
-                    }
+                // A folder or link where the file was isn't the item any
+                // more; like a missing folder, that pauses it.
+                guard values.isRegularFile == true, values.isSymbolicLink != true else { return .rootMissing }
+                if let record = fileRecord(path: "", url: root, values: values, previous: previous[""], now: now) {
+                    found[""] = record
+                } else {
+                    unknown.append("")
                 }
             } else if FileManager.default.fileExists(atPath: root.path(percentEncoded: false)) {
-                unreadable.append("")
+                unknown.append("")
             }
         }
 
+        var deletionTimes: [String: SyncTimestamp] = [:]
         for (path, record) in previous where found[path] == nil {
-            if unreadable.contains(where: { isSameOrInside(path, $0) }) {
+            if unknown.contains(where: { isSameOrInside(path, $0) }) {
                 found[path] = record
             } else if !record.isDeleted {
-                found[path] = record.deleted(at: max(now, record.version + 1))
+                let deleted = deletionTime(of: path, root: root, kind: kind, now: now, cache: &deletionTimes)
+                found[path] = record.deleted(at: max(deleted, record.version + 1))
             } else if now - record.version < tombstoneLifetime {
                 found[path] = record
             }
@@ -110,6 +116,39 @@ enum FileScanner {
     }
 
     private static let scanKeys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey]
+
+    /// The latest `path` can have been deleted: the modification time of the
+    /// nearest folder above it that still exists, which changed when it lost
+    /// the entry, and never later than `now`. `cache` holds the times already
+    /// looked up, by folder.
+    private static func deletionTime(of path: String, root: URL, kind: SyncItem.Kind, now: SyncTimestamp, cache: inout [String: SyncTimestamp]) -> SyncTimestamp {
+        guard kind == .folder else {
+            return min(now, modificationTime(of: root.deletingLastPathComponent()) ?? now)
+        }
+        var folder = (path as NSString).deletingLastPathComponent
+        while true {
+            if let cached = cache[folder] { return cached }
+            let url = folder.isEmpty ? root : root.appending(path: folder, directoryHint: .isDirectory)
+            if let modified = modificationTime(of: url), isDirectory(url) {
+                let time = min(now, modified)
+                cache[folder] = time
+                return time
+            }
+            guard !folder.isEmpty else { return now }
+            folder = (folder as NSString).deletingLastPathComponent
+        }
+    }
+
+    /// The modification time of whatever is at `url`, or nil when nothing is.
+    private static func modificationTime(of url: URL) -> SyncTimestamp? {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate?.syncTimestamp
+    }
+
+    /// `timestamp` as a version made by `now`: never before 1970 or after
+    /// `now`.
+    private static func version(_ timestamp: SyncTimestamp, cappedAt now: SyncTimestamp) -> SyncTimestamp {
+        min(max(timestamp, 0), now)
+    }
 
     /// Whether `path` is `ancestor` or inside it; the empty path is the root.
     private static func isSameOrInside(_ path: String, _ ancestor: String) -> Bool {
@@ -141,7 +180,7 @@ enum FileScanner {
     /// even when its modification time is older, as a restored or copied
     /// file's is. Nil when the file can't be read, which the scan treats as
     /// unknown rather than deleted.
-    private static func fileRecord(path: String, url: URL, values: URLResourceValues, previous: FileRecord?) -> FileRecord? {
+    private static func fileRecord(path: String, url: URL, values: URLResourceValues, previous: FileRecord?, now: SyncTimestamp) -> FileRecord? {
         guard let fileSize = values.fileSize, let modifiedDate = values.contentModificationDate else { return nil }
         let size = Int64(fileSize)
         let modified = modifiedDate.syncTimestamp
@@ -151,10 +190,12 @@ enum FileScanner {
         guard let hash = try? hash(of: url) else { return nil }
         if let previous, !previous.isDeleted, previous.kind == .file, previous.hash == hash {
             var touched = previous
+            touched.size = size
             touched.modified = modified
             return touched
         }
-        let version = previous.map { max(modified, $0.version + 1) } ?? modified
+        let base = version(modified, cappedAt: now)
+        let version = previous.map { max(base, $0.version + 1) } ?? base
         return FileRecord(path: path, kind: .file, version: version, size: size, modified: modified, hash: hash)
     }
 
@@ -164,8 +205,8 @@ enum FileScanner {
         if let previous, !previous.isDeleted, previous.kind == .directory {
             return previous
         }
-        let modified = ((try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .now).syncTimestamp
-        let version = previous.map { max(now, $0.version + 1) } ?? modified
+        let modified = modificationTime(of: url) ?? now
+        let version = previous.map { max(now, $0.version + 1) } ?? version(modified, cappedAt: now)
         return FileRecord(path: path, kind: .directory, version: version, modified: modified)
     }
 }
