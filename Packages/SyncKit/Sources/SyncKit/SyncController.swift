@@ -152,6 +152,11 @@ public final class SyncController {
     static let addressSettleDelay: Duration = .seconds(3)
     /// How long changes gather before they're announced to peers.
     static let announceDelay: Duration = .milliseconds(500)
+    /// How many hex digits of this Mac's endpoint ID name it in version
+    /// vectors: 64 bits, unique among one account's Macs and short enough
+    /// to repeat in every record. At most
+    /// `VersionVector.maximumMacIDLength`.
+    static let macIDLength = 16
 
     private static let log = Logger(subsystem: "dev.bunch.SyncKit", category: "controller")
     private static let relayAddressKey = "relayAddress"
@@ -217,7 +222,15 @@ public final class SyncController {
         guard let configuration, !isStarted else { return }
         isStarted = true
         do {
-            let engine = try SyncEngine(locations: configuration.locations, stateDirectory: configuration.stateDirectory)
+            let remote = configuration.remoteAccess
+            let store = SystemKeychainStore(accessGroup: remote.keychainAccessGroup)
+            let identity = try await Self.offMain { try DeviceIdentity.loadOrCreate(store: store, configuration: remote) }
+            self.identity = identity
+            let engine = try SyncEngine(
+                macID: String(identity.endpointID.prefix(Self.macIDLength)),
+                locations: configuration.locations,
+                stateDirectory: configuration.stateDirectory
+            )
             self.engine = engine
             await engine.observe { [weak self] event in
                 Task { @MainActor in self?.engineChanged(event) }
@@ -235,12 +248,8 @@ public final class SyncController {
             self.watcher = watcher
             await refreshItems()
 
-            let remote = configuration.remoteAccess
-            let store = SystemKeychainStore(accessGroup: remote.keychainAccessGroup)
             let registry = DeviceRegistry(store: store, configuration: remote)
             self.registry = registry
-            let identity = try await Self.offMain { try DeviceIdentity.loadOrCreate(store: store, configuration: remote) }
-            self.identity = identity
             let portKey = Self.defaultsKey(Self.listeningPortKey, for: configuration)
             let storedPort = UInt16(exactly: defaults.integer(forKey: portKey)).flatMap { $0 == 0 ? nil : $0 }
             let node = try await RemoteNode.start(identity: identity, configuration: remote, acceptingDevicesIn: registry, preferredPort: storedPort)
@@ -673,7 +682,7 @@ final class PeerSession {
     private func linkChanged(_ linkState: RemoteHostLink.State) {
         switch linkState {
         case .connected(let port, let token, let path):
-            peer = HTTPSyncPeer(port: port, token: token)
+            peer = HTTPSyncPeer(id: state.id, port: port, token: token)
             state.connection = .connected(path)
             pullRequests.yield()
         case .connecting, .awaitingApproval:

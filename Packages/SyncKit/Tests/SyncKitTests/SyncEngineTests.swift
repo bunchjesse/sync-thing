@@ -69,7 +69,8 @@ struct SyncEngineTests {
     }
 
     /// When both Macs changed a file before syncing, the newer edit wins on
-    /// both, whichever Mac pulls first.
+    /// both, whichever Mac pulls first, and the older one goes to the Trash
+    /// of the Mac that made it.
     @Test func newestEditWins() async throws {
         let directory = try TemporaryDirectory()
         defer { directory.remove() }
@@ -88,6 +89,8 @@ struct SyncEngineTests {
 
         #expect(studio.read("Notes/a.txt") == "newer edit")
         #expect(laptop.read("Notes/a.txt") == "newer edit")
+        #expect(studio.trash.all == ["older edit"])
+        #expect(laptop.trash.all.isEmpty)
     }
 
     /// A file changed on this Mac since its last scan is never overwritten
@@ -207,6 +210,8 @@ struct SyncEngineTests {
             #expect(mac.read("Notes/b.txt") == "only on studio")
             #expect(mac.read("Notes/c.txt") == "only on laptop")
         }
+        #expect(laptop.trash.all == ["laptop is older"])
+        #expect(studio.trash.all.isEmpty)
     }
 
     /// Peers can only name paths inside an item; anything that tries to
@@ -305,29 +310,168 @@ struct SyncEngineTests {
         #expect(await studio.engine.servableFile(itemID: "~/Notes", path: "a.txt") == nil)
     }
 
-    /// Records with impossible timestamps — far in the future or negative —
-    /// are ignored, so a broken peer can't win every conflict or overflow
-    /// the version arithmetic.
+    /// Records with impossible change times — far in the future or
+    /// negative — are ignored, so a broken peer can't win every conflict.
     @Test func implausibleRecordsAreIgnored() async throws {
         let directory = try TemporaryDirectory()
         defer { directory.remove() }
         let laptop = try TestMac(named: "laptop", in: directory)
         try laptop.write("mine", to: "Notes/a.txt")
+        try laptop.write("mine too", to: "Notes/b.txt")
         try await laptop.engine.addItem(at: laptop.url("Notes"))
         let now = Date().syncTimestamp
         let peer = FixedPeer(
             items: [SyncItem(id: "~/Notes", kind: .folder, version: 1)],
             records: [
-                FileRecord(path: "a.txt", kind: .file, isDeleted: true, version: .max, modified: now),
-                FileRecord(path: "b.txt", kind: .file, isDeleted: true, version: .min, modified: now),
-            ]
+                fileRecord("a.txt", "theirs", changed: .max),
+                fileRecord("b.txt", "theirs", changed: .min),
+                fileRecord("c.txt", "theirs", changed: now + SyncEngine.maximumClockSkew + 1),
+            ],
+            contents: ["a.txt": "theirs", "b.txt": "theirs", "c.txt": "theirs"]
         )
 
         let report = try await laptop.engine.pull(from: peer)
 
         #expect(report == SyncReport())
-        #expect(laptop.read("Notes/a.txt") == "mine")
+        #expect(laptop.tree("Notes") == ["a.txt": "mine", "b.txt": "mine too"])
         #expect(await laptop.engine.rescanAll() == false)
+    }
+
+    /// A Mac pulling again gets only the records that changed since its
+    /// last pull, and none when nothing did.
+    @Test func laterPullsGetOnlyChanges() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let studio = try TestMac(named: "studio", in: directory)
+        let laptop = try TestMac(named: "laptop", in: directory)
+        for index in 0..<5 {
+            try studio.write("\(index)", to: "Notes/\(index).txt")
+        }
+        try await studio.engine.addItem(at: studio.url("Notes"))
+        let peer = RecordingPeer(engine: studio.engine)
+
+        _ = try await laptop.engine.pull(from: peer)
+        try studio.write("edited", to: "Notes/2.txt")
+        try studio.remove("Notes/4.txt")
+        await studio.engine.rescanAll()
+        let report = try await laptop.engine.pull(from: peer)
+        _ = try await laptop.engine.pull(from: peer)
+
+        let batches = peer.batches
+        #expect(batches.count == 3)
+        #expect(batches[0].isComplete && batches[0].records.count == 5)
+        #expect(!batches[1].isComplete && batches[1].records.map(\.path) == ["2.txt", "4.txt"])
+        #expect(!batches[2].isComplete && batches[2].records.isEmpty)
+        #expect(report.downloaded == 1 && report.deleted == 1)
+        #expect(laptop.tree("Notes") == ["0.txt": "0", "1.txt": "1", "2.txt": "edited", "3.txt": "3"])
+    }
+
+    /// A Mac that relaunched starts its index afresh, so its peers' next
+    /// pulls get all of it, and nothing they had goes missing.
+    @Test func relaunchedPeerSendsItsWholeIndex() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let studio = try TestMac(named: "studio", in: directory)
+        let laptop = try TestMac(named: "laptop", in: directory)
+        try studio.write("a", to: "Notes/a.txt")
+        try await studio.engine.addItem(at: studio.url("Notes"))
+        _ = try await laptop.engine.pull(from: RecordingPeer(engine: studio.engine))
+
+        let relaunched = try TestMac(named: "studio", in: directory)
+        try relaunched.write("b", to: "Notes/b.txt")
+        await relaunched.engine.rescanAll()
+        let peer = RecordingPeer(engine: relaunched.engine)
+        let report = try await laptop.engine.pull(from: peer)
+
+        #expect(peer.batches.first?.isComplete == true)
+        #expect(report.downloaded == 1)
+        #expect(laptop.tree("Notes") == ["a.txt": "a", "b.txt": "b"])
+    }
+
+    /// A download that failed is tried again on the next pull, though the
+    /// peer's record didn't change and so isn't sent again: the pull plans
+    /// against the peer's whole index as last seen.
+    @Test func failedDownloadIsRetriedFromTheLastIndex() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let studio = try TestMac(named: "studio", in: directory)
+        let laptop = try TestMac(named: "laptop", in: directory)
+        try studio.write("a", to: "Notes/a.txt")
+        try await studio.engine.addItem(at: studio.url("Notes"))
+        let failing = FaultyPeer(base: EnginePeer(engine: studio.engine)) { _ in throw URLError(.badServerResponse) }
+
+        let failed = try await laptop.engine.pull(from: failing)
+        let retried = try await laptop.pull(from: studio)
+
+        #expect(failed.failed == 1)
+        #expect(retried.downloaded == 1)
+        #expect(laptop.read("Notes/a.txt") == "a")
+    }
+
+    /// A peer's edit that lost to this Mac's concurrent edit still beats
+    /// this Mac's later deletion, which never saw it. The peer's record
+    /// isn't sent again, so the pull plans from its whole index as last
+    /// seen.
+    @Test func deletionDoesNotBeatAConcurrentEditItNeverSaw() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let studio = try TestMac(named: "studio", in: directory)
+        let laptop = try TestMac(named: "laptop", in: directory)
+        try studio.write("original", to: "Notes/a.txt", modified: ago(100))
+        try await studio.engine.addItem(at: studio.url("Notes"))
+        try await laptop.pull(from: studio)
+
+        try studio.write("studio's", to: "Notes/a.txt", modified: ago(30))
+        await studio.engine.rescanAll()
+        try laptop.write("laptop's", to: "Notes/a.txt", modified: ago(10))
+        await laptop.engine.rescanAll()
+        let peer = RecordingPeer(engine: studio.engine)
+        let lost = try await laptop.engine.pull(from: peer)
+        try laptop.remove("Notes/a.txt")
+        await laptop.engine.rescanAll()
+        let back = try await laptop.engine.pull(from: peer)
+        try await studio.pull(from: laptop)
+
+        #expect(lost == SyncReport())
+        #expect(peer.batches.last?.isComplete == false && peer.batches.last?.records.isEmpty == true)
+        #expect(back.downloaded == 1)
+        for mac in [studio, laptop] {
+            #expect(mac.read("Notes/a.txt") == "studio's")
+        }
+    }
+
+    /// A tombstone pruned from a Mac's index after its lifetime starts the
+    /// index afresh, so a peer pulling changes learns the path is gone
+    /// from a whole index rather than never hearing of it.
+    @Test func prunedTombstoneStartsANewIndex() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let studio = try TestMac(named: "studio", in: directory)
+        let laptop = try TestMac(named: "laptop", in: directory)
+        try studio.write("a", to: "Notes/a.txt")
+        try await studio.engine.addItem(at: studio.url("Notes"))
+        let store = try SyncStore(directory: directory.url.appending(path: "studio-state"))
+        var index = try #require(store.loadIndex(itemID: "~/Notes"))
+        let expired = Date().syncTimestamp - FileScanner.tombstoneLifetime - 60_000
+        index["old.txt"] = FileRecord(
+            path: "old.txt", kind: .file, isDeleted: true, version: VersionVector(["studio": expired]), changed: expired, modified: expired
+        )
+        try store.save(index: index, itemID: "~/Notes")
+        let relaunched = try TestMac(named: "studio", in: directory)
+        let peer = RecordingPeer(engine: relaunched.engine)
+        _ = try await laptop.engine.pull(from: peer)
+        let before = try #require(peer.batches.last)
+        #expect(before.records.contains { $0.path == "old.txt" })
+
+        try relaunched.write("b", to: "Notes/b.txt")
+        await relaunched.engine.rescanAll()
+        _ = try await laptop.engine.pull(from: peer)
+
+        let after = try #require(peer.batches.last)
+        #expect(after.isComplete)
+        #expect(after.position.index != before.position.index)
+        #expect(!after.records.contains { $0.path == "old.txt" })
+        #expect(laptop.read("Notes/b.txt") == "b")
     }
 
     /// A peer's item list can't add an item this Mac's user couldn't: one

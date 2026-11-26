@@ -22,7 +22,7 @@ struct SyncServerTests {
         let port = try await server.start()
         defer { server.stop() }
 
-        let peer = HTTPSyncPeer(port: port, token: tokens.token(for: "laptop-id"))
+        let peer = HTTPSyncPeer(id: "studio", port: port, token: tokens.token(for: "laptop-id"))
         let report = try await laptop.engine.pull(from: peer)
 
         #expect(report.downloaded == 2)
@@ -42,12 +42,12 @@ struct SyncServerTests {
         defer { server.stop() }
 
         await #expect(throws: URLError.self) {
-            _ = try await HTTPSyncPeer(port: port, token: "not-issued").items()
+            _ = try await HTTPSyncPeer(id: "studio", port: port, token: "not-issued").items()
         }
         let token = tokens.token(for: "laptop-id")
         tokens.revoke("laptop-id")
         await #expect(throws: URLError.self) {
-            _ = try await HTTPSyncPeer(port: port, token: token).items()
+            _ = try await HTTPSyncPeer(id: "studio", port: port, token: token).items()
         }
     }
 
@@ -63,7 +63,7 @@ struct SyncServerTests {
         let port = try await server.start()
         defer { server.stop() }
 
-        try await HTTPSyncPeer(port: port, token: tokens.token(for: "laptop-id")).announceChange()
+        try await HTTPSyncPeer(id: "studio", port: port, token: tokens.token(for: "laptop-id")).announceChange()
         let timeout = Task {
             try await Task.sleep(for: .seconds(10))
             continuation.finish()
@@ -87,12 +87,12 @@ struct SyncServerTests {
         let server = SyncServer(engine: studio.engine, tokens: tokens) { _ in }
         let port = try await server.start()
         defer { server.stop() }
-        let peer = HTTPSyncPeer(port: port, token: tokens.token(for: "laptop-id"))
+        let peer = HTTPSyncPeer(id: "studio", port: port, token: tokens.token(for: "laptop-id"))
 
         await #expect(throws: URLError.self) {
             try await peer.download(itemID: "~/Notes", path: "../secret.txt", to: directory.url.appending(path: "out"))
         }
-        #expect(try await peer.records(forItem: "~/Other") == nil)
+        #expect(try await peer.records(forItem: "~/Other", after: nil) == nil)
     }
 
     /// A server for `mac`'s engine, the token it issued, and the port it
@@ -153,7 +153,7 @@ struct SyncServerTests {
         try await studio.engine.addItem(at: studio.url("Notes"))
         let (server, tokens, port) = try await serve(studio)
         defer { server.stop() }
-        let peer = RevokingPeer(base: HTTPSyncPeer(port: port, token: tokens.token(for: "laptop-id")), tokens: tokens, endpointID: "laptop-id")
+        let peer = RevokingPeer(base: HTTPSyncPeer(id: "studio", port: port, token: tokens.token(for: "laptop-id")), tokens: tokens, endpointID: "laptop-id")
 
         await #expect(throws: URLError(.userAuthenticationRequired)) {
             try await laptop.engine.pull(from: peer)
@@ -182,7 +182,7 @@ struct SyncServerTests {
         let redirectPort = try #require(await ports.first { _ in true })
 
         await #expect(throws: URLError(.badServerResponse)) {
-            _ = try await HTTPSyncPeer(port: UInt16(redirectPort), token: tokens.token(for: "laptop-id")).items()
+            _ = try await HTTPSyncPeer(id: "studio", port: UInt16(redirectPort), token: tokens.token(for: "laptop-id")).items()
         }
     }
 
@@ -217,12 +217,52 @@ struct SyncServerTests {
         let (server, tokens, port) = try await serve(studio)
         defer { server.stop() }
 
-        let report = try await laptop.engine.pull(from: HTTPSyncPeer(port: port, token: tokens.token(for: "laptop-id")))
+        let report = try await laptop.engine.pull(from: HTTPSyncPeer(id: "studio", port: port, token: tokens.token(for: "laptop-id")))
 
         #expect(report.failed == 0)
         for name in names {
             #expect(laptop.read("Notes/\(name)") == name)
         }
+    }
+
+    /// Over HTTP, a position in the host's current index gets only what
+    /// changed after it, and one from another index — the host relaunched
+    /// — or a malformed or negative one gets the whole index.
+    @Test func recordsAfterAPositionOverHTTP() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let studio = try TestMac(named: "studio", in: directory)
+        try studio.write("a", to: "Notes/a.txt")
+        try studio.write("b", to: "Notes/b.txt")
+        try await studio.engine.addItem(at: studio.url("Notes"))
+        let (server, tokens, port) = try await serve(studio)
+        defer { server.stop() }
+        let peer = HTTPSyncPeer(id: "studio", port: port, token: tokens.token(for: "laptop-id"))
+
+        let first = try #require(try await peer.records(forItem: "~/Notes", after: nil))
+        try studio.write("b changed", to: "Notes/b.txt")
+        await studio.engine.rescanAll()
+        let delta = try #require(try await peer.records(forItem: "~/Notes", after: first.position))
+        let stale = IndexPosition(index: "another", sequence: first.position.sequence)
+        let whole = try #require(try await peer.records(forItem: "~/Notes", after: stale))
+        let bearer = "Bearer \(tokens.token(for: "laptop-id"))"
+        var malformed: [String: RecordBatch] = [:]
+        for after in ["soon", "-1"] {
+            var request = URLRequest(url: try #require(URL(string: "http://127.0.0.1:\(port)/v1/records?item=~/Notes&index=\(first.position.index)&after=\(after)")))
+            request.setValue(bearer, forHTTPHeaderField: "Authorization")
+            let (data, _) = try await HTTPSyncPeer.session.data(for: request)
+            malformed[after] = try JSONDecoder().decode(RecordBatch.self, from: data)
+        }
+
+        #expect(first.isComplete)
+        #expect(first.records.map(\.path) == ["a.txt", "b.txt"])
+        #expect(!delta.isComplete)
+        #expect(delta.records.map(\.path) == ["b.txt"])
+        #expect(delta.position.index == first.position.index)
+        #expect(whole.isComplete)
+        #expect(whole.records.count == 2)
+        #expect(malformed.count == 2)
+        #expect(malformed.values.allSatisfy { $0.isComplete && $0.records.count == 2 })
     }
 }
 
@@ -236,12 +276,14 @@ private struct RevokingPeer: SyncPeer {
     /// The Mac whose token is revoked.
     let endpointID: String
 
+    var id: String { base.id }
+
     func items() async throws -> [SyncItem] {
         try await base.items()
     }
 
-    func records(forItem itemID: String) async throws -> [FileRecord]? {
-        try await base.records(forItem: itemID)
+    func records(forItem itemID: String, after position: IndexPosition?) async throws -> RecordBatch? {
+        try await base.records(forItem: itemID, after: position)
     }
 
     func download(itemID: String, path: String, to destination: URL) async throws {

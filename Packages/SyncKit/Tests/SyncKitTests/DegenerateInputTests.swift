@@ -69,7 +69,7 @@ struct DegenerateInputTests {
 
         let peer = FixedPeer(
             items: [SyncItem(id: "~/Notes", kind: .folder, version: 1)],
-            records: [fileRecord(".DS_Store", "evil", version: ago(1).syncTimestamp), fileRecord("Sub/.localized", "evil", version: ago(1).syncTimestamp)],
+            records: [fileRecord(".DS_Store", "evil", changed: ago(1).syncTimestamp), fileRecord("Sub/.localized", "evil", changed: ago(1).syncTimestamp)],
             contents: [".DS_Store": "evil", "Sub/.localized": "evil"]
         )
         #expect(try await laptop.engine.pull(from: peer) == SyncReport())
@@ -197,19 +197,19 @@ struct DegenerateInputTests {
         try laptop.write("mine", to: "Notes/a.txt", modified: ago(1000))
         try await laptop.engine.addItem(at: laptop.url("Notes"))
         let version = ago(10).syncTimestamp
-        var noHash = fileRecord("nohash.txt", "x", version: version)
+        var noHash = fileRecord("nohash.txt", "x", changed: version)
         noHash.hash = nil
-        var negative = fileRecord("negative.txt", "x", version: version)
+        var negative = fileRecord("negative.txt", "x", changed: version)
         negative.size = -1
         let peer = FixedPeer(
             items: [SyncItem(id: "~/Notes", kind: .folder, version: 1)],
             records: [
-                fileRecord("dup.txt", "first", version: version),
-                fileRecord("dup.txt", "second", version: version + 1),
+                fileRecord("dup.txt", "first", changed: version),
+                fileRecord("dup.txt", "second", changed: version + 1),
                 noHash,
                 negative,
-                fileRecord("a.txt/under.txt", "x", version: version),
-                fileRecord("good.txt", "good", version: version),
+                fileRecord("a.txt/under.txt", "x", changed: version),
+                fileRecord("good.txt", "good", changed: version),
             ],
             contents: ["dup.txt": "first", "nohash.txt": "x", "negative.txt": "x", "a.txt/under.txt": "x", "good.txt": "good"]
         )
@@ -221,5 +221,40 @@ struct DegenerateInputTests {
         #expect(laptop.read("Notes/nohash.txt") == nil)
         #expect(laptop.read("Notes/negative.txt") == nil)
         #expect(report.failed >= 2)
+    }
+
+    /// Records whose versions no working Mac could have made — no Macs,
+    /// too many, a counter that isn't positive or is near overflowing, a
+    /// Mac ID that is empty, too long, or holds a control character — are
+    /// ignored, and neither replace this Mac's files nor add any.
+    @Test func implausibleVersionsAreIgnored() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let laptop = try TestMac(named: "laptop", in: directory)
+        try laptop.write("mine", to: "Notes/a.txt", modified: ago(1000))
+        try await laptop.engine.addItem(at: laptop.url("Notes"))
+        let now = ago(0).syncTimestamp
+        let crowd = Dictionary(uniqueKeysWithValues: (0...VersionVector.maximumMacs).map { ("mac\($0)", now) })
+        let versions: [[String: Int64]] = [
+            [:], crowd, ["peer": 0], ["peer": -1], ["peer": .max], ["laptop": .max - 1, "peer": 1],
+            ["": now], [String(repeating: "m", count: 65): now], ["pe\u{0}er": now],
+        ]
+        let records = versions.enumerated().flatMap { index, counters in
+            var replacing = fileRecord("a.txt", "theirs \(index)", changed: now)
+            replacing.version = VersionVector(counters)
+            var adding = fileRecord("new\(index).txt", "new", changed: now)
+            adding.version = VersionVector(counters)
+            return [replacing, adding]
+        }
+        let peer = FixedPeer(
+            items: [SyncItem(id: "~/Notes", kind: .folder, version: 1)],
+            records: records,
+            contents: Dictionary(records.map { ($0.path, "x") }, uniquingKeysWith: { first, _ in first })
+        )
+
+        let report = try await laptop.engine.pull(from: peer)
+
+        #expect(report == SyncReport())
+        #expect(laptop.tree("Notes") == ["a.txt": "mine"])
     }
 }

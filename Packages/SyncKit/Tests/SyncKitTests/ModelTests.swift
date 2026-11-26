@@ -110,43 +110,178 @@ struct SafetyCheckTests {
     }
 
     /// Timestamps are plausible from 1970 to a week past now, inclusive,
-    /// and a record's size can't be negative. Its modification time can be
-    /// anything.
+    /// and a record needs a plausible version and change time and a size
+    /// that isn't negative. Its modification time can be anything.
     @Test func plausibility() {
         let now: SyncTimestamp = 1_800_000_000_000
         let limit = now + SyncEngine.maximumClockSkew
+        let version = VersionVector(["peer": now])
 
         #expect(SyncEngine.isPlausible(0, now: now))
         #expect(SyncEngine.isPlausible(limit, now: now))
         #expect(!SyncEngine.isPlausible(limit + 1, now: now))
         #expect(!SyncEngine.isPlausible(-1, now: now))
         #expect(!SyncEngine.isPlausible(.max, now: now))
-        #expect(SyncEngine.isPlausible(FileRecord(path: "a", kind: .file, version: now, modified: -1_000), now: now))
-        #expect(!SyncEngine.isPlausible(FileRecord(path: "a", kind: .file, version: now, size: -1, modified: now), now: now))
+        #expect(SyncEngine.isPlausible(FileRecord(path: "a", kind: .file, version: version, changed: now, modified: -1_000), now: now))
+        #expect(!SyncEngine.isPlausible(FileRecord(path: "a", kind: .file, version: version, changed: now, size: -1, modified: now), now: now))
+        #expect(!SyncEngine.isPlausible(FileRecord(path: "a", kind: .file, version: version, changed: limit + 1, modified: now), now: now))
+        #expect(!SyncEngine.isPlausible(FileRecord(path: "a", kind: .file, version: VersionVector(), changed: now, modified: now), now: now))
+    }
+
+    /// A peer's vector names one to 64 Macs, each by a short ID without
+    /// control characters, with a positive counter no further ahead of
+    /// this Mac's clock than a timestamp may be, so the next change always
+    /// has room.
+    @Test func vectorPlausibility() {
+        let now: SyncTimestamp = 1_800_000_000_000
+        let limit = now + SyncEngine.maximumClockSkew
+        let many = VersionVector(Dictionary(uniqueKeysWithValues: (0...VersionVector.maximumMacs).map { ("mac\($0)", Int64(1)) }))
+        let most = VersionVector(Dictionary(uniqueKeysWithValues: (1...VersionVector.maximumMacs).map { ("mac\($0)", Int64(1)) }))
+
+        #expect(VersionVector(["a": 1]).isPlausible(now: now))
+        #expect(VersionVector(["a": limit]).isPlausible(now: now))
+        #expect(most.isPlausible(now: now))
+        #expect(!many.isPlausible(now: now))
+        #expect(!VersionVector().isPlausible(now: now))
+        #expect(!VersionVector(["a": 0]).isPlausible(now: now))
+        #expect(!VersionVector(["a": -5]).isPlausible(now: now))
+        #expect(!VersionVector(["a": limit + 1]).isPlausible(now: now))
+        #expect(!VersionVector(["a": .max]).isPlausible(now: now))
+        #expect(!VersionVector(["": 1]).isPlausible(now: now))
+        #expect(!VersionVector([String(repeating: "x", count: VersionVector.maximumMacIDLength + 1): 1]).isPlausible(now: now))
+        #expect(!VersionVector(["a\u{0}": 1]).isPlausible(now: now))
+    }
+}
+
+struct VersionVectorTests {
+    /// A vector that saw every change another did, and more, comes after
+    /// it; one each saw changes the other didn't are concurrent; a Mac a
+    /// vector doesn't name counts as zero.
+    @Test func comparison() {
+        let base = VersionVector(["a": 1])
+        let later = VersionVector(["a": 2])
+        let other = VersionVector(["a": 1, "b": 1])
+        let fork = VersionVector(["b": 1])
+
+        #expect(base.compare(to: base) == .equal)
+        #expect(later.compare(to: base) == .after)
+        #expect(base.compare(to: later) == .before)
+        #expect(other.compare(to: base) == .after)
+        #expect(later.compare(to: other) == .concurrent)
+        #expect(fork.compare(to: base) == .concurrent)
+        #expect(VersionVector().compare(to: base) == .before)
+        #expect(VersionVector(["a": 0]).compare(to: VersionVector()) == .equal)
+    }
+
+    /// Merging keeps each Mac's larger counter, so the result comes after
+    /// or equals both.
+    @Test func merging() {
+        let one = VersionVector(["a": 3, "b": 1])
+        let two = VersionVector(["b": 5, "c": 2])
+
+        let merged = one.merged(with: two)
+
+        #expect(merged == VersionVector(["a": 3, "b": 5, "c": 2]))
+        #expect(merged.compare(to: one) == .after)
+        #expect(merged.compare(to: two) == .after)
+        #expect(merged == two.merged(with: one))
+    }
+
+    /// A change moves only its own Mac's counter, to the larger of one more
+    /// and now, so the result comes after what it changed and a Mac that
+    /// lost its state doesn't reuse a counter.
+    @Test func incrementing() {
+        let version = VersionVector(["a": 5, "b": 10])
+
+        let bySlowClock = version.incremented(for: "b", now: 3)
+        let byClock = version.incremented(for: "c", now: 1_000)
+
+        #expect(bySlowClock == VersionVector(["a": 5, "b": 11]))
+        #expect(byClock == VersionVector(["a": 5, "b": 10, "c": 1_000]))
+        #expect(bySlowClock.compare(to: version) == .after)
+        #expect(bySlowClock.compare(to: byClock) == .concurrent)
+    }
+
+    /// The tie-breaking order is a strict total order over distinct
+    /// vectors: never reflexive, one way or the other between any two, and
+    /// transitive, so three Macs agree on the last one.
+    @Test func sortingIsTotal() {
+        let vectors = [
+            VersionVector(["a": 1]), VersionVector(["a": 2]), VersionVector(["b": 1]),
+            VersionVector(["a": 1, "b": 1]), VersionVector(["a": 2, "c": 1]), VersionVector(["c": 5]),
+        ]
+
+        for one in vectors {
+            #expect(!one.sortsBefore(one))
+            for two in vectors where two != one {
+                #expect(one.sortsBefore(two) != two.sortsBefore(one))
+                for three in vectors where one.sortsBefore(two) && two.sortsBefore(three) {
+                    #expect(one.sortsBefore(three))
+                }
+            }
+        }
+    }
+
+    /// A vector is a plain JSON object of counters by Mac.
+    @Test func codesAsAnObject() throws {
+        let version = VersionVector(["studio": 7])
+
+        let data = try JSONEncoder().encode(version)
+
+        #expect(String(decoding: data, as: UTF8.self) == #"{"studio":7}"#)
+        #expect(try JSONDecoder().decode(VersionVector.self, from: data) == version)
     }
 }
 
 struct FileRecordTests {
-    /// The newer version wins.
-    @Test func newerVersionWins() {
-        let old = FileRecord(path: "a", kind: .file, version: 1, modified: 1, hash: "x")
-        let new = FileRecord(path: "a", kind: .file, version: 2, modified: 2, hash: "y")
+    /// A record of `kind` at "a" with `version`, `changed` at that time,
+    /// and `hash`.
+    private func record(
+        _ version: [String: Int64],
+        changed: SyncTimestamp = 5,
+        kind: FileRecord.Kind = .file,
+        hash: String? = "x"
+    ) -> FileRecord {
+        FileRecord(path: "a", kind: kind, version: VersionVector(version), changed: changed, modified: changed, hash: kind == .file ? hash : nil)
+    }
+
+    /// A version that saw another's changes replaces it, whatever the
+    /// times say, and never the other way around.
+    @Test func laterVersionWinsWhateverTheClock() {
+        let old = record(["studio": 1], changed: 1_000, hash: "x")
+        let new = record(["studio": 1, "laptop": 1], changed: 1, hash: "y")
 
         #expect(new.supersedes(old))
         #expect(!old.supersedes(new))
     }
 
-    /// A tie goes the same way on both Macs: deletion first, then the
-    /// larger hash.
-    @Test func tiesAreBrokenTheSameWayEverywhere() {
-        let file = FileRecord(path: "a", kind: .file, version: 5, modified: 5, hash: "a")
-        let other = FileRecord(path: "a", kind: .file, version: 5, modified: 5, hash: "b")
-        let tombstone = file.deleted(at: 5)
+    /// Concurrent versions go to the later change; a deletion loses to any
+    /// concurrent edit, even a much earlier one; the loser never wins back.
+    @Test func concurrentVersionsGoToTheLaterChange() {
+        let studio = record(["base": 1, "studio": 1], changed: 10, hash: "x")
+        let laptop = record(["base": 1, "laptop": 1], changed: 20, hash: "y")
+        let tombstone = studio.deleted(as: VersionVector(["base": 1, "mini": 1]), at: 99)
 
-        #expect(tombstone.supersedes(file))
-        #expect(!file.supersedes(tombstone))
-        #expect(other.supersedes(file))
-        #expect(!file.supersedes(other))
+        #expect(laptop.supersedes(studio))
+        #expect(!studio.supersedes(laptop))
+        #expect(studio.supersedes(tombstone))
+        #expect(!tombstone.supersedes(studio))
+    }
+
+    /// Ties between concurrent versions changed at the same time go the
+    /// same way on every Mac — directory, then larger hash, then the
+    /// version that sorts last — and a record never supersedes itself.
+    @Test func tiesAreBrokenTheSameWayEverywhere() {
+        let file = record(["studio": 1], hash: "a")
+        let other = record(["laptop": 1], hash: "b")
+        let directory = record(["mini": 1], kind: .directory)
+        let same = record(["laptop": 1], hash: "a")
+
+        #expect(other.supersedes(file) && !file.supersedes(other))
+        #expect(directory.supersedes(file) && !file.supersedes(directory))
+        #expect(file.supersedes(same) != same.supersedes(file))
+        #expect(!file.supersedes(file))
+        #expect(!directory.supersedes(directory))
     }
 
     /// An item's newer entry wins, and a removal wins a tie.
@@ -160,34 +295,35 @@ struct FileRecordTests {
         #expect(!added.supersedes(removed))
     }
 
-    /// A file and a directory tied on version resolve the same way on both
-    /// Macs, and a record never supersedes itself.
-    @Test func fileAndDirectoryTiesAreDeterministic() {
-        let file = FileRecord(path: "a", kind: .file, version: 5, modified: 5, hash: "x")
-        let directory = FileRecord(path: "a", kind: .directory, version: 5, modified: 5)
-
-        #expect(file.supersedes(directory) != directory.supersedes(file))
-        #expect(!file.supersedes(file))
-        #expect(!directory.supersedes(directory))
-    }
-
     /// Records describe the same thing when both are deletions, both the
     /// same directory, or files with the same hash — whatever their
     /// versions.
     @Test func sameContent() {
-        let file = FileRecord(path: "a", kind: .file, version: 1, modified: 1, hash: "x")
+        let file = record(["studio": 1], changed: 1, hash: "x")
         var later = file
-        later.version = 9
+        later.version = VersionVector(["studio": 9])
         later.modified = 9
-        let other = FileRecord(path: "a", kind: .file, version: 1, modified: 1, hash: "y")
-        let directory = FileRecord(path: "a", kind: .directory, version: 1, modified: 1)
+        let other = record(["studio": 1], changed: 1, hash: "y")
+        let directory = record(["studio": 1], changed: 1, kind: .directory)
 
         #expect(file.hasSameContent(as: later))
         #expect(!file.hasSameContent(as: other))
         #expect(!file.hasSameContent(as: directory))
-        #expect(directory.hasSameContent(as: FileRecord(path: "a", kind: .directory, version: 7, modified: 7)))
-        #expect(file.deleted(at: 3).hasSameContent(as: directory.deleted(at: 4)))
-        #expect(!file.hasSameContent(as: file.deleted(at: 3)))
+        #expect(directory.hasSameContent(as: record(["laptop": 7], changed: 7, kind: .directory)))
+        #expect(file.deleted(as: VersionVector(["a": 3]), at: 3).hasSameContent(as: directory.deleted(as: VersionVector(["b": 4]), at: 4)))
+        #expect(!file.hasSameContent(as: file.deleted(as: VersionVector(["a": 3]), at: 3)))
+    }
+
+    /// A record survives a round trip through JSON, its version as a plain
+    /// object of counters by Mac.
+    @Test func recordsRoundTrip() throws {
+        let record = record(["studio": 3, "laptop": 7], changed: 9, hash: "h")
+
+        let data = try JSONEncoder().encode(record)
+        let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        #expect(try JSONDecoder().decode(FileRecord.self, from: data) == record)
+        #expect(object["version"] as? [String: Int] == ["studio": 3, "laptop": 7])
     }
 }
 
@@ -203,7 +339,7 @@ struct FileScannerTests {
         try Data("two".utf8).write(to: root.appending(path: "Sub/two.txt"))
         try Data().write(to: root.appending(path: ".DS_Store"))
 
-        guard case .scanned(let records) = FileScanner.scan(root: root, kind: .folder, previous: [:], now: 1) else {
+        guard case .scanned(let records) = FileScanner.scan(root: root, kind: .folder, previous: [:], mac: "studio", now: 1) else {
             Issue.record("scan didn't find the folder")
             return
         }
@@ -211,24 +347,25 @@ struct FileScannerTests {
         #expect(Set(records.keys) == ["one.txt", "Sub", "Sub/two.txt"])
         #expect(records["one.txt"]?.hash == "7692c3ad3540bb803c020b3aee66cd8887123234ea0c6e7143c0add73ff431ed")
         #expect(records["Sub"]?.kind == .directory)
+        #expect(records["one.txt"]?.version == VersionVector(["studio": 1]))
     }
 
     /// An unchanged file keeps its record; a deleted one becomes a tombstone
-    /// newer than the version it replaces.
+    /// by this Mac, after the version it replaces and dated now.
     @Test func rescanKeepsUnchangedAndTombstonesDeleted() throws {
         let directory = try TemporaryDirectory()
         defer { directory.remove() }
         let root = directory.url
         try Data("keep".utf8).write(to: root.appending(path: "keep.txt"))
         try Data("gone".utf8).write(to: root.appending(path: "gone.txt"))
-        guard case .scanned(let first) = FileScanner.scan(root: root, kind: .folder, previous: [:], now: 1) else {
+        guard case .scanned(let first) = FileScanner.scan(root: root, kind: .folder, previous: [:], mac: "studio", now: 1) else {
             Issue.record("scan didn't find the folder")
             return
         }
 
         try FileManager.default.removeItem(at: root.appending(path: "gone.txt"))
         let later = Date().syncTimestamp
-        guard case .scanned(let second) = FileScanner.scan(root: root, kind: .folder, previous: first, now: later) else {
+        guard case .scanned(let second) = FileScanner.scan(root: root, kind: .folder, previous: first, mac: "studio", now: later) else {
             Issue.record("scan didn't find the folder")
             return
         }
@@ -236,7 +373,8 @@ struct FileScannerTests {
         #expect(second["keep.txt"] == first["keep.txt"])
         let tombstone = try #require(second["gone.txt"])
         #expect(tombstone.isDeleted)
-        #expect(tombstone.supersedes(try #require(first["gone.txt"])))
+        #expect(tombstone.version.compare(to: try #require(first["gone.txt"]).version) == .after)
+        #expect(tombstone.changed == later)
     }
 
     /// A file that comes back after a deletion goes after the tombstone even
@@ -247,9 +385,11 @@ struct FileScannerTests {
         let file = directory.url.appending(path: "restored.txt")
         try Data("back".utf8).write(to: file)
         try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_000)], ofItemAtPath: file.path(percentEncoded: false))
-        let tombstone = FileRecord(path: "restored.txt", kind: .file, isDeleted: true, version: 2_000_000, modified: 2_000_000)
+        let tombstone = FileRecord(
+            path: "restored.txt", kind: .file, isDeleted: true, version: VersionVector(["laptop": 2_000_000]), changed: 2_000_000, modified: 2_000_000
+        )
 
-        guard case .scanned(let records) = FileScanner.scan(root: directory.url, kind: .folder, previous: ["restored.txt": tombstone], now: 3_000_000) else {
+        guard case .scanned(let records) = FileScanner.scan(root: directory.url, kind: .folder, previous: ["restored.txt": tombstone], mac: "studio", now: 3_000_000) else {
             Issue.record("scan didn't find the folder")
             return
         }
@@ -257,40 +397,64 @@ struct FileScannerTests {
         let record = try #require(records["restored.txt"])
         #expect(!record.isDeleted)
         #expect(record.supersedes(tombstone))
+        #expect(record.version == VersionVector(["laptop": 2_000_000, "studio": 3_000_000]))
         #expect(record.modified == 1_000_000)
+    }
+
+    /// An edit moves only this Mac's counter, keeping what the version had
+    /// seen of the others, so it comes after the version it replaces.
+    @Test func editsMoveOnlyThisMacsCounter() throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let file = directory.url.appending(path: "a.txt")
+        try Data("edited".utf8).write(to: file)
+        let previous = FileRecord(
+            path: "a.txt", kind: .file, version: VersionVector(["laptop": 7, "studio": 2]), changed: 1, size: 1, modified: 1, hash: "old"
+        )
+
+        let records = scan(directory.url, previous: ["a.txt": previous], now: 5)
+
+        #expect(records["a.txt"]?.version == VersionVector(["laptop": 7, "studio": 5]))
+        #expect(records["a.txt"]?.version.compare(to: previous.version) == .after)
     }
 
     /// A missing root is reported as missing, never as every file deleted.
     @Test func missingRootIsNotADeletion() throws {
         let directory = try TemporaryDirectory()
         defer { directory.remove() }
-        let previous = ["a.txt": FileRecord(path: "a.txt", kind: .file, version: 1, size: 1, modified: 1, hash: "h")]
+        let previous = ["a.txt": FileRecord(path: "a.txt", kind: .file, version: VersionVector(["studio": 1]), changed: 1, size: 1, modified: 1, hash: "h")]
 
-        let outcome = FileScanner.scan(root: directory.url.appending(path: "Unmounted"), kind: .folder, previous: previous, now: 2)
+        let outcome = FileScanner.scan(root: directory.url.appending(path: "Unmounted"), kind: .folder, previous: previous, mac: "studio", now: 2)
 
         #expect(outcome == .rootMissing)
     }
 
-    /// Scans `root` as a folder and returns its records, recording an issue
-    /// when the root is missing.
+    /// Scans `root` as a folder on "studio" and returns its records,
+    /// recording an issue when the root is missing.
     private func scan(_ root: URL, previous: [String: FileRecord] = [:], now: SyncTimestamp = Date().syncTimestamp) -> [String: FileRecord] {
-        guard case .scanned(let records) = FileScanner.scan(root: root, kind: .folder, previous: previous, now: now) else {
+        guard case .scanned(let records) = FileScanner.scan(root: root, kind: .folder, previous: previous, mac: "studio", now: now) else {
             Issue.record("scan didn't find the folder")
             return [:]
         }
         return records
     }
 
-    /// A tombstone is kept until it's 90 days old, then dropped.
+    /// A tombstone is kept until it's about fifteen months old, then
+    /// dropped.
     @Test func tombstonesArePrunedAfterTheirLifetime() throws {
         let directory = try TemporaryDirectory()
         defer { directory.remove() }
         let now: SyncTimestamp = 1_800_000_000_000
-        let young = FileRecord(path: "young", kind: .file, isDeleted: true, version: now - FileScanner.tombstoneLifetime + 1, modified: 0)
-        let old = FileRecord(path: "old", kind: .file, isDeleted: true, version: now - FileScanner.tombstoneLifetime, modified: 0)
+        let young = FileRecord(
+            path: "young", kind: .file, isDeleted: true, version: VersionVector(["laptop": 1]), changed: now - FileScanner.tombstoneLifetime + 1, modified: 0
+        )
+        let old = FileRecord(
+            path: "old", kind: .file, isDeleted: true, version: VersionVector(["laptop": 1]), changed: now - FileScanner.tombstoneLifetime, modified: 0
+        )
 
         let records = scan(directory.url, previous: ["young": young, "old": old], now: now)
 
+        #expect(FileScanner.tombstoneLifetime == 456 * 24 * 60 * 60 * 1000)
         #expect(records == ["young": young])
     }
 
@@ -357,32 +521,29 @@ struct FileScannerTests {
         #expect(second == first)
     }
 
-    /// A deletion is dated by its folder's modification time — when the
-    /// folder lost the entry — not by when the scan noticed, and never
-    /// later than now.
-    @Test func deletionsAreDatedByTheirFolder() throws {
+    /// A deletion is this Mac's change, made when the scan found it: what
+    /// orders it is the version it saw, not the folder's clock.
+    @Test func deletionsAreThisMacsChangeNow() throws {
         let directory = try TemporaryDirectory()
         defer { directory.remove() }
         let root = directory.url.appending(path: "Notes")
         try FileManager.default.createDirectory(at: root.appending(path: "Sub"), withIntermediateDirectories: true)
         try Data("a".utf8).write(to: root.appending(path: "Sub/a.txt"))
-        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_000)], ofItemAtPath: root.appending(path: "Sub/a.txt").path(percentEncoded: false))
-        let first = scan(root)
+        let first = scan(root, now: 1_700_000_000_000)
 
         try FileManager.default.removeItem(at: root.appending(path: "Sub/a.txt"))
-        let deletedAt = Date(timeIntervalSince1970: 1_700_000_000)
-        try FileManager.default.setAttributes([.modificationDate: deletedAt], ofItemAtPath: root.appending(path: "Sub").path(percentEncoded: false))
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_000)], ofItemAtPath: root.appending(path: "Sub").path(percentEncoded: false))
         let second = scan(root, previous: first, now: 1_800_000_000_000)
-        let capped = scan(root, previous: first, now: 1_600_000_000_000)
 
-        #expect(second["Sub/a.txt"]?.isDeleted == true)
-        #expect(second["Sub/a.txt"]?.version == deletedAt.syncTimestamp)
-        #expect(capped["Sub/a.txt"]?.version == 1_600_000_000_000)
+        let tombstone = try #require(second["Sub/a.txt"])
+        #expect(tombstone.isDeleted)
+        #expect(tombstone.changed == 1_800_000_000_000)
+        #expect(tombstone.version == VersionVector(["studio": 1_800_000_000_000]))
     }
 
-    /// A file stamped in the future gets a version no later than now, so a
-    /// later change anywhere can outrank it; its stamp is kept as is.
-    @Test func futureFilesAreVersionedNow() throws {
+    /// A file stamped in the future gets a change time no later than now, so
+    /// it can't win every conflict; its stamp is kept as is.
+    @Test func futureFilesChangeNow() throws {
         let directory = try TemporaryDirectory()
         defer { directory.remove() }
         let file = directory.url.appending(path: "a.txt")
@@ -392,7 +553,7 @@ struct FileScannerTests {
 
         let records = scan(directory.url, now: 1_800_000_000_000)
 
-        #expect(records["a.txt"]?.version == 1_800_000_000_000)
+        #expect(records["a.txt"]?.changed == 1_800_000_000_000)
         #expect(records["a.txt"]?.modified == future.syncTimestamp)
     }
 
@@ -430,16 +591,16 @@ struct FileScannerTests {
         let directory = try TemporaryDirectory()
         defer { directory.remove() }
         let file = directory.url.appending(path: "config")
-        let previous = ["": FileRecord(path: "", kind: .file, version: 1, size: 1, modified: 1, hash: "h")]
+        let previous = ["": FileRecord(path: "", kind: .file, version: VersionVector(["studio": 1]), changed: 1, size: 1, modified: 1, hash: "h")]
         try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
-        #expect(FileScanner.scan(root: file, kind: .file, previous: previous, now: 2) == .rootMissing)
+        #expect(FileScanner.scan(root: file, kind: .file, previous: previous, mac: "studio", now: 2) == .rootMissing)
 
         try FileManager.default.removeItem(at: file)
         try FileManager.default.createSymbolicLink(at: file, withDestinationURL: directory.url)
-        #expect(FileScanner.scan(root: file, kind: .file, previous: previous, now: 2) == .rootMissing)
+        #expect(FileScanner.scan(root: file, kind: .file, previous: previous, mac: "studio", now: 2) == .rootMissing)
 
         try FileManager.default.removeItem(at: file)
-        guard case .scanned(let records) = FileScanner.scan(root: file, kind: .file, previous: previous, now: 2) else {
+        guard case .scanned(let records) = FileScanner.scan(root: file, kind: .file, previous: previous, mac: "studio", now: 2) else {
             Issue.record("a deleted file isn't a missing root")
             return
         }
@@ -458,7 +619,7 @@ struct SyncStoreTests {
         #expect(store.loadIndex(itemID: "~/Notes") == nil)
 
         let items = [SyncItem(id: "~/Notes", kind: .folder, version: 1), SyncItem(id: "~/Old", kind: .folder, version: 2, isRemoved: true)]
-        let index = ["a.txt": FileRecord(path: "a.txt", kind: .file, version: 1, size: 1, modified: 1, hash: "h")]
+        let index = ["a.txt": FileRecord(path: "a.txt", kind: .file, version: VersionVector(["studio": 1, "laptop": 3]), changed: 1, size: 1, modified: 1, hash: "h")]
         try store.save(items: items)
         try store.save(index: index, itemID: "~/Notes")
 

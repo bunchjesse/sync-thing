@@ -13,40 +13,44 @@ struct ConflictTests {
         try await syncAll(macs)
     }
 
-    /// An edit made after another Mac deleted the file wins, and the file
-    /// comes back there — even when the deleting Mac only noticed the
-    /// deletion later, as when it was quit at the time.
-    @Test func laterEditBeatsEarlierDeletion() async throws {
+    /// An edit made without seeing another Mac's deletion beats it, and the
+    /// file comes back there — even when the deletion came later.
+    @Test func concurrentEditBeatsDeletion() async throws {
         let directory = try TemporaryDirectory()
         defer { directory.remove() }
         let studio = try TestMac(named: "studio", in: directory)
         let laptop = try TestMac(named: "laptop", in: directory)
         try await start([studio, laptop], with: ["a.txt": "original"])
 
-        try studio.remove("Notes/a.txt")
-        try studio.setModified(ago(1000), of: "Notes")
         try laptop.write("edited", to: "Notes/a.txt", modified: ago(500))
+        await laptop.engine.rescanAll()
+        try studio.remove("Notes/a.txt")
+        await studio.engine.rescanAll()
         try await syncAll([studio, laptop])
 
         #expect(studio.read("Notes/a.txt") == "edited")
         #expect(laptop.read("Notes/a.txt") == "edited")
+        #expect(studio.trash.all.isEmpty && laptop.trash.all.isEmpty)
     }
 
-    /// A deletion made after another Mac's edit wins on both.
-    @Test func laterDeletionBeatsEarlierEdit() async throws {
+    /// A deletion made after the Mac saw another's edit wins on both, the
+    /// edit going to the Trash, whatever the clocks say.
+    @Test func deletionAfterSeeingTheEditWins() async throws {
         let directory = try TemporaryDirectory()
         defer { directory.remove() }
         let studio = try TestMac(named: "studio", in: directory)
         let laptop = try TestMac(named: "laptop", in: directory)
         try await start([studio, laptop], with: ["a.txt": "original"])
 
-        try laptop.write("edited", to: "Notes/a.txt", modified: ago(1000))
+        try laptop.write("edited", to: "Notes/a.txt", modified: ago(10))
+        try await syncAll([studio, laptop])
+        #expect(studio.read("Notes/a.txt") == "edited")
         try studio.remove("Notes/a.txt")
-        try studio.setModified(ago(500), of: "Notes")
         try await syncAll([studio, laptop])
 
         #expect(studio.read("Notes/a.txt") == nil)
         #expect(laptop.read("Notes/a.txt") == nil)
+        #expect(laptop.trash.all == ["edited"])
     }
 
     /// A file recreated after its deletion synced — even a restored copy
@@ -124,6 +128,7 @@ struct ConflictTests {
         for mac in [studio, laptop] {
             #expect(mac.tree("Notes") == ["Thing": "/", "Thing/added.txt": "added"])
         }
+        #expect(studio.trash.all == ["a file"])
     }
 
     /// A rename that only changes case reaches the other Mac in one pull,
@@ -158,7 +163,7 @@ struct ConflictTests {
         let version = ago(100).syncTimestamp
         let peer = FixedPeer(
             items: [SyncItem(id: "~/Notes", kind: .folder, version: 1)],
-            records: [fileRecord("a.txt", "lower", version: version), fileRecord("A.txt", "upper", version: version)],
+            records: [fileRecord("a.txt", "lower", changed: version), fileRecord("A.txt", "upper", changed: version)],
             contents: ["a.txt": "lower", "A.txt": "upper"]
         )
 
@@ -182,10 +187,10 @@ struct ConflictTests {
         let peer = FixedPeer(
             items: [SyncItem(id: "~/Notes", kind: .folder, version: 1)],
             records: [
-                FileRecord(path: "Docs", kind: .directory, version: version, modified: version),
-                fileRecord("Docs/mine.txt", "mine", version: ago(1_000).syncTimestamp),
-                FileRecord(path: "docs", kind: .directory, version: version, modified: version),
-                fileRecord("docs/theirs.txt", "theirs", version: version),
+                directoryRecord("Docs", changed: version),
+                fileRecord("Docs/mine.txt", "mine", changed: ago(1_000).syncTimestamp),
+                directoryRecord("docs", changed: version),
+                fileRecord("docs/theirs.txt", "theirs", changed: version),
             ],
             contents: ["Docs/mine.txt": "mine", "docs/theirs.txt": "theirs"]
         )
@@ -218,7 +223,7 @@ struct ConflictTests {
     }
 
     /// Two different edits with the very same modification time resolve the
-    /// same way on both Macs.
+    /// same way on both Macs, the losing copy going to its own Mac's Trash.
     @Test func simultaneousEditsPickOneWinnerEverywhere() async throws {
         let directory = try TemporaryDirectory()
         defer { directory.remove() }
@@ -231,8 +236,138 @@ struct ConflictTests {
         try laptop.write("laptop's", to: "Notes/a.txt", modified: moment)
         try await syncAll([studio, laptop])
 
-        #expect(studio.read("Notes/a.txt") == laptop.read("Notes/a.txt"))
+        let winner = try #require(studio.read("Notes/a.txt"))
+        #expect(laptop.read("Notes/a.txt") == winner)
         #expect(studio.timestamp("Notes/a.txt") == moment.syncTimestamp)
+        #expect(laptop.timestamp("Notes/a.txt") == moment.syncTimestamp)
+        let loser = winner == "studio's" ? laptop : studio
+        let winningMac = winner == "studio's" ? studio : laptop
+        #expect(loser.trash.all == [winner == "studio's" ? "laptop's" : "studio's"])
+        #expect(winningMac.trash.all.isEmpty)
+    }
+
+    /// Edits made on two Macs before either saw the other's conflict: the
+    /// later one wins everywhere, and only the Mac whose edit lost does
+    /// anything — its copy goes to its Trash, counted as a conflict.
+    @Test func concurrentEditsTrashTheLosersCopy() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let studio = try TestMac(named: "studio", in: directory)
+        let laptop = try TestMac(named: "laptop", in: directory)
+        try await start([studio, laptop], with: ["a.txt": "original"])
+
+        try studio.write("studio's", to: "Notes/a.txt", modified: ago(20))
+        try laptop.write("laptop's", to: "Notes/a.txt", modified: ago(10))
+        await studio.engine.rescanAll()
+        await laptop.engine.rescanAll()
+        let atLaptop = try await laptop.pull(from: studio)
+        let atStudio = try await studio.pull(from: laptop)
+        let backAtLaptop = try await laptop.pull(from: studio)
+
+        #expect(atLaptop == SyncReport())
+        #expect(atStudio.conflicts == 1 && atStudio.downloaded == 1)
+        #expect(backAtLaptop == SyncReport())
+        #expect(studio.read("Notes/a.txt") == "laptop's")
+        #expect(laptop.read("Notes/a.txt") == "laptop's")
+        #expect(studio.trash.all == ["studio's"])
+        #expect(laptop.trash.all.isEmpty)
+        #expect(await studio.engine.rescanAll() == false)
+        #expect(await laptop.engine.rescanAll() == false)
+    }
+
+    /// An edit made after the Mac saw another's replaces it, even with a
+    /// much older modification time, as a restored or copied file has; the
+    /// replaced edit was seen, so it isn't a conflict.
+    @Test func editAfterSeeingAnotherWinsWhateverTheClock() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let studio = try TestMac(named: "studio", in: directory)
+        let laptop = try TestMac(named: "laptop", in: directory)
+        try await start([studio, laptop], with: ["a.txt": "original"])
+
+        try studio.write("first", to: "Notes/a.txt", modified: ago(10))
+        try await syncAll([studio, laptop])
+        #expect(laptop.read("Notes/a.txt") == "first")
+        try laptop.write("second", to: "Notes/a.txt", modified: ago(5_000))
+        await laptop.engine.rescanAll()
+        let report = try await studio.pull(from: laptop)
+
+        #expect(report.downloaded == 1 && report.conflicts == 0)
+        #expect(studio.read("Notes/a.txt") == "second")
+        #expect(studio.trash.all.isEmpty && laptop.trash.all.isEmpty)
+    }
+
+    /// Three Macs editing the same file before any syncs settle on the
+    /// latest edit everywhere, and neither losing edit is lost: each is in
+    /// some Mac's Trash.
+    @Test func threeConcurrentEditsConverge() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let studio = try TestMac(named: "studio", in: directory)
+        let laptop = try TestMac(named: "laptop", in: directory)
+        let mini = try TestMac(named: "mini", in: directory)
+        try await start([studio, laptop, mini], with: ["a.txt": "original"])
+
+        try studio.write("studio's", to: "Notes/a.txt", modified: ago(30))
+        try laptop.write("laptop's", to: "Notes/a.txt", modified: ago(20))
+        try mini.write("mini's", to: "Notes/a.txt", modified: ago(10))
+        try await syncAll([studio, laptop, mini])
+
+        let trashed = Set(studio.trash.all + laptop.trash.all + mini.trash.all)
+        for mac in [studio, laptop, mini] {
+            #expect(mac.tree("Notes") == ["a.txt": "mini's"])
+            #expect(await mac.engine.rescanAll() == false)
+        }
+        #expect(trashed.isSuperset(of: ["studio's", "laptop's"]))
+        #expect(!trashed.contains("mini's"))
+        #expect(studio.trash.all.contains("studio's"))
+    }
+
+    /// Concurrent edits that arrive at the same contents aren't a conflict:
+    /// nothing goes to the Trash, and both keep the winner's time.
+    @Test func concurrentIdenticalEditsMergeSilently() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let studio = try TestMac(named: "studio", in: directory)
+        let laptop = try TestMac(named: "laptop", in: directory)
+        try await start([studio, laptop], with: ["a.txt": "original"])
+
+        try studio.write("same", to: "Notes/a.txt", modified: ago(20))
+        try laptop.write("same", to: "Notes/a.txt", modified: ago(10))
+        await studio.engine.rescanAll()
+        await laptop.engine.rescanAll()
+        let report = try await studio.pull(from: laptop)
+        try await syncAll([studio, laptop])
+
+        #expect(report == SyncReport())
+        #expect(studio.timestamp("Notes/a.txt") == laptop.timestamp("Notes/a.txt"))
+        #expect(studio.trash.all.isEmpty && laptop.trash.all.isEmpty)
+    }
+
+    /// A folder with files made on one Mac beats a file of the same name
+    /// made concurrently on another, whichever came later: the folder and
+    /// its files reach both, and the file goes to its Mac's Trash.
+    @Test(arguments: [false, true])
+    func folderWithFilesBeatsConcurrentFile(fileIsLater: Bool) async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let studio = try TestMac(named: "studio", in: directory)
+        let laptop = try TestMac(named: "laptop", in: directory)
+        try await start([studio, laptop], with: ["other.txt": "other"])
+
+        try laptop.write("inside", to: "Notes/Thing/inside.txt", modified: ago(100))
+        try laptop.setModified(ago(100), of: "Notes/Thing")
+        await laptop.engine.rescanAll()
+        try studio.write("a file", to: "Notes/Thing", modified: fileIsLater ? ago(10) : ago(1_000))
+        await studio.engine.rescanAll()
+        try await syncAll([studio, laptop])
+
+        for mac in [studio, laptop] {
+            #expect(mac.tree("Notes") == ["other.txt": "other", "Thing": "/", "Thing/inside.txt": "inside"])
+            #expect(await mac.engine.rescanAll() == false)
+        }
+        #expect(studio.trash.all == ["a file"])
+        #expect(laptop.trash.all.isEmpty)
     }
 
     /// Three Macs each making different changes — an edit, a new file, a

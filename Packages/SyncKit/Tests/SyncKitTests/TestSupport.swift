@@ -24,23 +24,30 @@ struct TemporaryDirectory {
 }
 
 /// One simulated Mac: an engine whose home folder and state live in a
-/// temporary directory, and whose deletions are permanent rather than
-/// going to the real Trash.
+/// temporary directory, and whose Trash is a list of what was thrown away
+/// rather than the real Trash.
 struct TestMac {
     /// The Mac's engine.
     let engine: SyncEngine
     /// The Mac's home folder.
     let home: URL
+    /// What the Mac moved to the Trash.
+    let trash: Trash
 
-    /// Creates a Mac inside `directory`, named `name`.
+    /// Creates a Mac inside `directory`, named `name`, which is also its ID
+    /// in versions. A Mac created again with the same name is the same Mac
+    /// relaunched.
     init(named name: String, in directory: TemporaryDirectory) throws {
         home = directory.url.appending(path: name, directoryHint: .isDirectory)
         let state = directory.url.appending(path: "\(name)-state", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let trash = Trash()
+        self.trash = trash
         engine = try SyncEngine(
+            macID: name,
             locations: SyncLocations(home: home),
             stateDirectory: state,
-            removeFile: { try FileManager.default.removeItem(at: $0) }
+            removeFile: { try trash.throwAway($0) }
         )
     }
 
@@ -113,14 +120,50 @@ func ago(_ seconds: TimeInterval) -> Date {
     Date(syncTimestamp: Date.now.addingTimeInterval(-seconds).syncTimestamp)
 }
 
-/// A peer's record of a file at `path` holding `contents`.
-func fileRecord(_ path: String, _ contents: String, version: SyncTimestamp, modified: SyncTimestamp? = nil) -> FileRecord {
+/// A peer's record of a file at `path` holding `contents`, changed by `mac`
+/// at `changed`.
+func fileRecord(_ path: String, _ contents: String, changed: SyncTimestamp, by mac: String = "peer", modified: SyncTimestamp? = nil) -> FileRecord {
     let hash = SHA256.hash(data: Data(contents.utf8)).map { String(format: "%02x", $0) }.joined()
-    return FileRecord(path: path, kind: .file, version: version, size: Int64(contents.utf8.count), modified: modified ?? version, hash: hash)
+    return FileRecord(
+        path: path,
+        kind: .file,
+        version: VersionVector([mac: changed]),
+        changed: changed,
+        size: Int64(contents.utf8.count),
+        modified: modified ?? changed,
+        hash: hash
+    )
+}
+
+/// A peer's record of a directory at `path`, made by `mac` at `changed`.
+func directoryRecord(_ path: String, changed: SyncTimestamp, by mac: String = "peer") -> FileRecord {
+    FileRecord(path: path, kind: .directory, version: VersionVector([mac: changed]), changed: changed, modified: changed)
+}
+
+/// What a ``TestMac`` moved to the Trash: the contents of each file, in
+/// order.
+final class Trash: Sendable {
+    private let contents = Mutex<[String]>([])
+
+    /// Records the file at `url`'s contents, then deletes it.
+    func throwAway(_ url: URL) throws {
+        let data = try? Data(contentsOf: url)
+        try FileManager.default.removeItem(at: url)
+        if let data {
+            contents.withLock { $0.append(String(decoding: data, as: UTF8.self)) }
+        }
+    }
+
+    /// The contents of every file thrown away so far.
+    var all: [String] {
+        contents.withLock { $0 }
+    }
 }
 
 /// A peer that serves a fixed item list, index, and file contents.
 struct FixedPeer: SyncPeer {
+    /// The same for every fixed peer; each serves one complete index.
+    let id = "fixed"
     /// The item list to serve.
     var items: [SyncItem]
     /// The index served for every item; nil to say the peer isn't syncing
@@ -131,7 +174,9 @@ struct FixedPeer: SyncPeer {
 
     func items() async throws -> [SyncItem] { items }
 
-    func records(forItem itemID: String) async throws -> [FileRecord]? { records }
+    func records(forItem itemID: String, after position: IndexPosition?) async throws -> RecordBatch? {
+        records.map { RecordBatch(position: IndexPosition(index: "fixed", sequence: 0), isComplete: true, records: $0) }
+    }
 
     func download(itemID: String, path: String, to destination: URL) async throws {
         guard let contents = contents[path] else { throw URLError(.fileDoesNotExist) }
@@ -163,12 +208,14 @@ struct FaultyPeer: SyncPeer {
     /// as when the file changes on the peer mid-download.
     var altered: Set<String> = []
 
+    var id: String { base.id }
+
     func items() async throws -> [SyncItem] {
         try await base.items()
     }
 
-    func records(forItem itemID: String) async throws -> [FileRecord]? {
-        try await base.records(forItem: itemID)
+    func records(forItem itemID: String, after position: IndexPosition?) async throws -> RecordBatch? {
+        try await base.records(forItem: itemID, after: position)
     }
 
     func download(itemID: String, path: String, to destination: URL) async throws {
@@ -220,12 +267,14 @@ struct EnginePeer: SyncPeer {
     /// The engine being served.
     let engine: SyncEngine
 
+    var id: String { engine.macID }
+
     func items() async throws -> [SyncItem] {
         await engine.allItems()
     }
 
-    func records(forItem itemID: String) async throws -> [FileRecord]? {
-        await engine.records(forItem: itemID)
+    func records(forItem itemID: String, after position: IndexPosition?) async throws -> RecordBatch? {
+        await engine.records(forItem: itemID, after: position)
     }
 
     func download(itemID: String, path: String, to destination: URL) async throws {
@@ -236,8 +285,44 @@ struct EnginePeer: SyncPeer {
     }
 }
 
+/// A peer that serves another engine like ``EnginePeer`` and keeps every
+/// batch of records it served.
+final class RecordingPeer: SyncPeer {
+    /// The engine being served.
+    let base: EnginePeer
+    private let served = Mutex<[RecordBatch]>([])
+
+    /// Creates a peer serving `engine`.
+    init(engine: SyncEngine) {
+        base = EnginePeer(engine: engine)
+    }
+
+    var id: String { base.id }
+
+    /// Every batch served so far, in order.
+    var batches: [RecordBatch] {
+        served.withLock { $0 }
+    }
+
+    func items() async throws -> [SyncItem] {
+        try await base.items()
+    }
+
+    func records(forItem itemID: String, after position: IndexPosition?) async throws -> RecordBatch? {
+        let batch = try await base.records(forItem: itemID, after: position)
+        if let batch {
+            served.withLock { $0.append(batch) }
+        }
+        return batch
+    }
+
+    func download(itemID: String, path: String, to destination: URL) async throws {
+        try await base.download(itemID: itemID, path: path, to: destination)
+    }
+}
+
 extension TestMac {
-    /// Pulls everything `other` has that is newer.
+    /// Pulls from `other` directly, as over a tunnel.
     @discardableResult
     func pull(from other: TestMac) async throws -> SyncReport {
         try await engine.pull(from: EnginePeer(engine: other.engine))

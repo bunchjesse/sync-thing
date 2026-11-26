@@ -4,11 +4,18 @@ import os
 /// One Mac's side of syncing: the item list, each item's index, and the
 /// rules for pulling a peer's changes onto disk.
 ///
-/// The engine never pushes. ``pull(from:)`` downloads whatever a peer has
-/// that is newer — newest change wins, path by path — and the peer pulls
-/// from this Mac in turn when told something changed (``Event``). An item
-/// that reaches a copy this Mac already had is held, neither pulled into
-/// nor served, until the user answers ``joinQuestion()``.
+/// The engine never pushes. ``pull(from:)`` brings over whatever a peer has
+/// that came after this Mac's version of a path (``VersionVector``), and
+/// the peer pulls from this Mac in turn when told something changed
+/// (``Event``). When the two changed a path concurrently, only the Mac
+/// whose version loses the conflict does anything: its copy goes to the
+/// Trash and it takes the winner's. An item that reaches a copy this Mac
+/// already had is held, neither pulled into nor served, until the user
+/// answers ``joinQuestion()``.
+///
+/// A pull asks only for what changed in the peer's index since the last
+/// one (``IndexPosition``), and plans against the peer's whole index as
+/// last seen, so a path that couldn't sync last time is tried again.
 ///
 /// Scanning, hashing, and downloading run off the actor, so it can take
 /// other calls meanwhile; every change to an index is therefore checked
@@ -31,6 +38,10 @@ public actor SyncEngine {
         case joinQuestionChanged
     }
 
+    /// Identifies this Mac in the ``VersionVector`` of every change it
+    /// makes.
+    public nonisolated let macID: String
+
     /// Where portable paths point on this Mac.
     nonisolated let locations: SyncLocations
 
@@ -38,6 +49,11 @@ public actor SyncEngine {
     private let removeFile: @Sendable (URL) throws -> Void
     private var items: [String: SyncItem]
     private var indexes: [String: [String: FileRecord]] = [:]
+    /// Where each index is, for peers asking what changed since they last
+    /// pulled.
+    private var positions: [String: IndexState] = [:]
+    /// Each peer's index of each item as last pulled, by peer and item.
+    private var remoteIndexes: [String: [String: RemoteIndex]] = [:]
     /// Bumped on every change to an item's index, so a scan that ran while
     /// a pull changed the index knows its result is stale.
     private var generations: [String: Int] = [:]
@@ -48,23 +64,28 @@ public actor SyncEngine {
     /// Items that reached copies this Mac already had, held back — neither
     /// pulled into nor served — until the user makes a ``JoinChoice``.
     private var awaitingChoice: Set<String>
-    /// The latest index a peer served of each item in ``awaitingChoice``.
-    private var peerRecords: [String: [String: FileRecord]] = [:]
+    /// What the other Macs have of each item in ``awaitingChoice``.
+    private var peerRecords: [String: PeerIndex] = [:]
     private var observer: (@Sendable (Event) -> Void)?
 
     private static let log = Logger(subsystem: "dev.bunch.SyncKit", category: "engine")
     private static let ioQueue = DispatchQueue(label: "dev.bunch.SyncKit.io", qos: .utility, attributes: .concurrent)
 
-    /// Creates an engine that keeps its state in `stateDirectory`.
+    /// Creates an engine for the Mac `macID` names, keeping its state in
+    /// `stateDirectory`.
     ///
-    /// - Parameter removeFile: Disposes of a file a peer deleted. Defaults to
-    ///   moving it to the Trash, so a deletion that arrives by mistake can
+    /// - Parameter macID: Must be unique among the Macs that sync and stay
+    ///   the same across launches.
+    /// - Parameter removeFile: Disposes of a file a peer deleted, or one that
+    ///   lost a conflict. Defaults to moving it to the Trash, so either can
     ///   be undone.
     public init(
+        macID: String,
         locations: SyncLocations,
         stateDirectory: URL,
         removeFile: @escaping @Sendable (URL) throws -> Void = SyncEngine.moveToTrash
     ) throws {
+        self.macID = macID
         self.locations = locations
         self.removeFile = removeFile
         let store = try SyncStore(directory: stateDirectory)
@@ -74,6 +95,9 @@ public actor SyncEngine {
         self.awaitingChoice = store.loadAwaitingChoice()
         for item in loaded where !item.isRemoved {
             indexes[item.id] = store.loadIndex(itemID: item.id)
+            if indexes[item.id] != nil {
+                positions[item.id] = IndexState()
+            }
         }
     }
 
@@ -138,6 +162,7 @@ public actor SyncEngine {
         let item = SyncItem(id: id, kind: kind, version: Self.nextVersion(after: items[id]?.version))
         items[id] = item
         indexes[id] = nil
+        positions[id] = nil
         saveItems()
         Self.log.notice("Added \(id, privacy: .private)")
         observer?(.itemsChanged)
@@ -264,6 +289,10 @@ public actor SyncEngine {
     /// stops being synced. The files stay.
     private func forgetIndex(_ itemID: String) {
         indexes[itemID] = nil
+        positions[itemID] = nil
+        for peerID in remoteIndexes.keys {
+            remoteIndexes[peerID]?[itemID] = nil
+        }
         generations[itemID, default: 0] += 1
         missingRoots.remove(itemID)
         dirtyIndexes.remove(itemID)
@@ -316,8 +345,9 @@ public actor SyncEngine {
             let generation = generations[itemID, default: 0]
             let root = url(for: item)
             let now = Date().syncTimestamp
+            let macID = macID
             let outcome = await Self.onIOQueue {
-                FileScanner.scan(root: root, kind: item.kind, previous: previous, now: now)
+                FileScanner.scan(root: root, kind: item.kind, previous: previous, mac: macID, now: now)
             }
             guard items[itemID]?.isRemoved == false else { return changed }
             guard generation == generations[itemID, default: 0] else {
@@ -335,9 +365,7 @@ public actor SyncEngine {
                     observer?(.availabilityChanged(itemID: itemID))
                 }
                 if indexes[itemID] == nil || records != previous {
-                    indexes[itemID] = records
-                    generations[itemID, default: 0] += 1
-                    dirtyIndexes.insert(itemID)
+                    commit(records, for: itemID, changing: Self.changedPaths(from: previous, to: records))
                     changed = true
                 }
             }
@@ -362,13 +390,19 @@ public actor SyncEngine {
 
     // MARK: - Serving
 
-    /// This Mac's index of `itemID`, for a peer to pull, or nil while the
-    /// item isn't synced here, its root is missing, or it awaits the user's
-    /// ``JoinChoice``.
-    public func records(forItem itemID: String) -> [FileRecord]? {
+    /// This Mac's index of `itemID`, for a peer to pull: the records that
+    /// changed after `position` when it is in the current index, otherwise
+    /// all of them. Nil while the item isn't synced here, its root is
+    /// missing, or it awaits the user's ``JoinChoice``.
+    public func records(forItem itemID: String, after position: IndexPosition? = nil) -> RecordBatch? {
         guard items[itemID]?.isRemoved == false, !missingRoots.contains(itemID), !awaitingChoice.contains(itemID),
-              let index = indexes[itemID] else { return nil }
-        return index.values.sorted { $0.path < $1.path }
+              let index = indexes[itemID], let state = positions[itemID] else { return nil }
+        let current = IndexPosition(index: state.id, sequence: state.sequence)
+        if let position, position.index == state.id, position.sequence <= state.sequence {
+            let changed = index.values.filter { state.sequences[$0.path, default: 0] > position.sequence }
+            return RecordBatch(position: current, isComplete: false, records: changed.sorted { $0.path < $1.path })
+        }
+        return RecordBatch(position: current, isComplete: true, records: index.values.sorted { $0.path < $1.path })
     }
 
     /// The file a peer may download at `path` in `itemID`: only a file this
@@ -388,8 +422,9 @@ public actor SyncEngine {
 
     /// Brings this Mac up to date with `peer`: adopts its newer item-list
     /// entries, then downloads, deletes, and creates whatever paths it has
-    /// newer versions of. Throws when the peer can't be reached; a single
-    /// path that fails is counted in the report and tried again next time.
+    /// later versions of, or versions that win a conflict. Throws when the
+    /// peer can't be reached; a single path that fails is counted in the
+    /// report and tried again next time.
     public func pull(from peer: some SyncPeer) async throws -> SyncReport {
         var report = SyncReport()
         for item in mergeItems(try await peer.items()) {
@@ -400,12 +435,44 @@ public actor SyncEngine {
                 await rescan(itemID: item.id)
             }
             guard indexes[item.id] != nil, !missingRoots.contains(item.id) else { continue }
-            guard let remote = try await peer.records(forItem: item.id) else { continue }
+            guard let remote = try await remoteIndex(of: item, from: peer) else { continue }
             if awaitingChoice.contains(item.id), !hold(item, remote: remote) { continue }
             try await pull(item, records: remote, from: peer, into: &report)
         }
         return report
     }
+
+    /// `peer`'s whole index of `item`: the one the last pull from it saw,
+    /// brought up to date with what changed since, or a new one when the
+    /// peer started its index afresh. Only records at safe paths are kept.
+    /// Nil when the peer isn't syncing the item, or sends changes to an
+    /// index this Mac never saw, after which the next pull asks for all of
+    /// it.
+    private func remoteIndex(of item: SyncItem, from peer: some SyncPeer) async throws -> [FileRecord]? {
+        let known = remoteIndexes[peer.id]?[item.id]
+        let batch = try await peer.records(forItem: item.id, after: known?.position)
+        guard let batch, items[item.id]?.isRemoved == false, batch.position.index.utf8.count <= Self.maximumIndexIDLength else {
+            remoteIndexes[peer.id]?[item.id] = nil
+            return nil
+        }
+        var records: [String: FileRecord] = [:]
+        if !batch.isComplete {
+            guard let known, known.position.index == batch.position.index else {
+                Self.log.error("Ignoring changes to an index of \(item.id, privacy: .private) this Mac never saw")
+                remoteIndexes[peer.id]?[item.id] = nil
+                return nil
+            }
+            records = known.records
+        }
+        for record in batch.records where Self.isSafe(path: record.path, in: item) {
+            records[record.path] = record
+        }
+        remoteIndexes[peer.id, default: [:]][item.id] = RemoteIndex(position: batch.position, records: records)
+        return records.values.sorted { $0.path < $1.path }
+    }
+
+    /// The longest index ID a peer may give; this Mac's are UUIDs.
+    private static let maximumIndexIDLength = 64
 
     // MARK: - Joining
 
@@ -414,7 +481,7 @@ public actor SyncEngine {
     public func joinQuestion() -> JoinQuestion? {
         let items = awaitingChoice.sorted().compactMap { itemID -> JoinQuestion.Item? in
             guard let local = indexes[itemID], let remote = peerRecords[itemID] else { return nil }
-            return JoinQuestion.Item(id: itemID, differingFiles: Self.differences(local, remote).files)
+            return JoinQuestion.Item(id: itemID, differingFiles: Self.differences(local, remote.winners).files)
         }
         return items.isEmpty ? nil : JoinQuestion(items: items)
     }
@@ -439,20 +506,23 @@ public actor SyncEngine {
 
     /// Adds `remote`, a peer's index of `item`, which awaits the user's
     /// choice, to what the other Macs are known to have: path by path, the
-    /// record that wins. Returns whether the item can sync now — when this
-    /// Mac has nothing the others lack, there is nothing to choose, and
-    /// their copy is taken.
+    /// record that wins, and every version seen. Returns whether the item
+    /// can sync now — when this Mac has nothing the others lack, there is
+    /// nothing to choose, and their copy is taken.
     private func hold(_ item: SyncItem, remote: [FileRecord]) -> Bool {
-        var records = peerRecords[item.id] ?? [:]
-        let previous = records
-        for record in Self.admissible(remote, in: item) where records[record.path].map(record.supersedes) ?? true {
-            records[record.path] = record
+        var peers = peerRecords[item.id] ?? PeerIndex()
+        let previous = peers
+        for record in Self.admissible(remote, in: item) {
+            peers.seen[record.path] = (peers.seen[record.path] ?? VersionVector()).merged(with: record.version)
+            if peers.winners[record.path].map(record.supersedes) ?? true {
+                peers.winners[record.path] = record
+            }
         }
-        peerRecords[item.id] = records
-        if let local = indexes[item.id], Self.differences(local, records).localFiles == 0, settle(item, by: .useOtherMacs) {
+        peerRecords[item.id] = peers
+        if let local = indexes[item.id], Self.differences(local, peers.winners).localFiles == 0, settle(item, by: .useOtherMacs) {
             return true
         }
-        if previous != records {
+        if previous.winners != peers.winners {
             observer?(.joinQuestionChanged)
         }
         return false
@@ -481,23 +551,29 @@ public actor SyncEngine {
     /// is kept and the item stays held.
     @discardableResult
     private func settle(_ item: SyncItem, by choice: JoinChoice) -> Bool {
-        guard var index = indexes[item.id], let remote = peerRecords[item.id] else { return false }
+        guard var index = indexes[item.id], let peers = peerRecords[item.id] else { return false }
+        let original = index
+        let remote = peers.winners
         var isComplete = true
         switch choice {
         case .useThisMac:
-            // Versions after every Mac's, and tombstones for what only
-            // they have, so this copy wins everywhere.
+            // Versions after every one the other Macs served, and
+            // tombstones for what only they have, so this copy wins on each
+            // of them; a change made on a Mac not yet heard from is
+            // concurrent, and conflicts like any other.
             let now = Date().syncTimestamp
             for path in Set(index.keys).union(remote.keys) {
                 let mine = index[path].flatMap { $0.isDeleted ? nil : $0 }
                 let theirs = remote[path].flatMap { $0.isDeleted ? nil : $0 }
                 if let mine, let theirs, mine.hasSameContent(as: theirs) { continue }
-                let version = max(now, (remote[path]?.version ?? 0) + 1, (index[path]?.version ?? 0) + 1)
+                let seen = (peers.seen[path] ?? VersionVector()).merged(with: index[path]?.version ?? VersionVector())
+                let version = seen.incremented(for: macID, now: now)
                 if var mine {
                     mine.version = version
+                    mine.changed = now
                     index[path] = mine
                 } else if let theirs {
-                    index[path] = theirs.deleted(at: version)
+                    index[path] = theirs.deleted(as: version, at: now)
                 }
             }
         case .useOtherMacs:
@@ -550,7 +626,7 @@ public actor SyncEngine {
                 index[path] = given
             }
         }
-        commit(index, for: item.id)
+        commit(index, for: item.id, changing: Self.changedPaths(from: original, to: index))
         flush(item.id)
         observer?(.filesChanged(itemID: item.id))
         guard isComplete else {
@@ -566,18 +642,68 @@ public actor SyncEngine {
     }
 
     /// The records in a peer's `remote` index of `item` that this Mac will
-    /// consider: those with safe paths and plausible sizes and timestamps.
+    /// consider: those with safe paths and plausible sizes, versions, and
+    /// timestamps.
     private static func admissible(_ remote: [FileRecord], in item: SyncItem) -> [FileRecord] {
         let now = Date().syncTimestamp
         return remote.filter { isSafe(path: $0.path, in: item) && isPlausible($0, now: now) }
     }
 
     /// Makes `index` `itemID`'s index, to be saved by the next ``flush(_:)``,
-    /// and marks scans that started before it stale.
-    private func commit(_ index: [String: FileRecord], for itemID: String) {
+    /// and marks scans that started before it stale. `paths` are the ones
+    /// that differ from the index it replaces; each is numbered as the
+    /// index's next change, for peers asking what changed. A path that left
+    /// the index — which a peer asking for changes would never hear of —
+    /// starts a new index instead, which peers pull whole.
+    private func commit(_ index: [String: FileRecord], for itemID: String, changing paths: some Collection<String>) {
+        let previous = indexes[itemID]
         indexes[itemID] = index
         generations[itemID, default: 0] += 1
         dirtyIndexes.insert(itemID)
+        guard var state = positions[itemID], let previous, !paths.contains(where: { index[$0] == nil && previous[$0] != nil }) else {
+            positions[itemID] = IndexState()
+            return
+        }
+        for path in paths where index[path] != nil {
+            state.sequence += 1
+            state.sequences[path] = state.sequence
+        }
+        positions[itemID] = state
+    }
+
+    /// The paths whose records differ between `old` and `new`, including
+    /// those only one has.
+    private static func changedPaths(from old: [String: FileRecord], to new: [String: FileRecord]) -> Set<String> {
+        Set(old.keys).union(new.keys).filter { old[$0] != new[$0] }
+    }
+
+    /// Where one of this Mac's indexes is: an ID for this run of it, and
+    /// the number of the latest change to each path.
+    private struct IndexState {
+        /// Identifies the index, new each launch and each time a path
+        /// leaves it.
+        let id = UUID().uuidString
+        /// The number of the latest change.
+        var sequence: Int64 = 0
+        /// The number of each path's latest change; zero for paths
+        /// unchanged since the index started.
+        var sequences: [String: Int64] = [:]
+    }
+
+    /// A peer's index of one item, as this Mac last pulled it.
+    private struct RemoteIndex {
+        /// Where the peer's index was.
+        let position: IndexPosition
+        /// Its records, by path.
+        let records: [String: FileRecord]
+    }
+
+    /// What the other Macs have of an item awaiting a ``JoinChoice``.
+    private struct PeerIndex: Equatable {
+        /// For each path, the record that wins among the other Macs'.
+        var winners: [String: FileRecord] = [:]
+        /// For each path, every version the other Macs have.
+        var seen: [String: VersionVector] = [:]
     }
 
     /// One change a pull will make, and the local record it was planned
@@ -592,8 +718,13 @@ public actor SyncEngine {
         }
 
         let kind: Kind
+        /// The record the path takes: a peer's, with its version merged
+        /// with this Mac's when it won a conflict.
         let remote: FileRecord
         let expected: FileRecord?
+        /// Whether ``expected`` is a file this Mac changed concurrently,
+        /// which lost the conflict and goes to the Trash.
+        var replacesConflictingFile = false
 
         /// How many components the path has. Directories are created
         /// shallowest first and deleted deepest first.
@@ -670,6 +801,10 @@ public actor SyncEngine {
                     case .deleteFile, .deleteDirectory: report.deleted += 1
                     case .createDirectory, .adopt: break
                     }
+                    if action.replacesConflictingFile {
+                        report.conflicts += 1
+                        Self.log.notice("\(action.remote.path, privacy: .private) changed here and on another Mac; this Mac's copy went to the Trash")
+                    }
                 }
             } catch {
                 Self.log.error("Couldn't apply \(action.remote.path, privacy: .private): \(error.localizedDescription, privacy: .private)")
@@ -679,41 +814,56 @@ public actor SyncEngine {
         if report != changedBefore {
             let downloaded = report.downloaded - changedBefore.downloaded
             let deleted = report.deleted - changedBefore.deleted
+            let conflicts = report.conflicts - changedBefore.conflicts
             let failed = report.failed - changedBefore.failed
-            Self.log.info("Pulled \(item.id, privacy: .private): \(downloaded) downloaded, \(deleted) deleted, \(failed) failed")
+            Self.log.info("Pulled \(item.id, privacy: .private): \(downloaded) downloaded, \(deleted) deleted, \(conflicts) conflicts, \(failed) failed")
         }
     }
 
     /// The changes that bring `item` up to date with a peer's `remote`
-    /// records, in the order they must happen. Records with impossible
-    /// paths, sizes, or timestamps are ignored, as are tombstones this Mac
-    /// has already pruned or would prune.
+    /// records, in the order they must happen. A record whose version came
+    /// after this Mac's replaces it; one concurrent with it replaces it only
+    /// by winning the conflict (``FileRecord/winsConflict(over:)``), and
+    /// then has seen both versions, so the peer takes it as is. Records
+    /// with impossible paths, sizes, versions, or timestamps are ignored,
+    /// as are tombstones this Mac has already pruned or would prune.
     private func plan(_ item: SyncItem, remote: [FileRecord]) -> [Action] {
         let local = indexes[item.id] ?? [:]
         let now = Date().syncTimestamp
         var actions: [Action] = []
         for record in Self.admissible(remote, in: item) {
             let current = local[record.path]
-            let isExpired = record.isDeleted && now - record.version >= FileScanner.tombstoneLifetime
-            if isExpired, current == nil || current?.isDeleted == true { continue }
-            if let current, current.hasSameContent(as: record) {
-                if record.supersedes(current) {
-                    actions.append(Action(kind: .adopt, remote: record, expected: current))
+            let isExpired = record.isDeleted && now - record.changed >= FileScanner.tombstoneLifetime
+            if isExpired, current?.isDeleted != false { continue }
+            var incoming = record
+            var isConflict = false
+            if let current {
+                switch record.version.compare(to: current.version) {
+                case .after:
+                    break
+                case .before:
+                    continue
+                case .equal, .concurrent:
+                    guard record.winsConflict(over: current) else { continue }
+                    incoming.version = record.version.merged(with: current.version)
+                    isConflict = current.kind == .file && !current.isDeleted && !record.hasSameContent(as: current)
                 }
-                continue
+                if incoming.hasSameContent(as: current) {
+                    actions.append(Action(kind: .adopt, remote: incoming, expected: current))
+                    continue
+                }
             }
-            if let current, !record.supersedes(current) { continue }
             let kind: Action.Kind
-            if record.isDeleted {
+            if incoming.isDeleted {
                 if current == nil || current?.isDeleted == true {
                     kind = .adopt
                 } else {
                     kind = current?.kind == .directory ? .deleteDirectory : .deleteFile
                 }
             } else {
-                kind = record.kind == .directory ? .createDirectory : .download
+                kind = incoming.kind == .directory ? .createDirectory : .download
             }
-            actions.append(Action(kind: kind, remote: record, expected: current))
+            actions.append(Action(kind: kind, remote: incoming, expected: current, replacesConflictingFile: isConflict))
         }
         return actions.sorted { lhs, rhs in
             if lhs.kind != rhs.kind { return lhs.kind < rhs.kind }
@@ -741,7 +891,7 @@ public actor SyncEngine {
                 throw CocoaError(.fileWriteNoPermission, userInfo: [NSFilePathErrorKey: url.path(percentEncoded: false)])
             }
             index[path] = action.remote
-            commit(index, for: item.id)
+            commit(index, for: item.id, changing: [path])
             return .recorded
         }
         guard Self.disk(at: url, matches: action.expected) else {
@@ -774,11 +924,14 @@ public actor SyncEngine {
                 guard Self.isEffectivelyEmpty(url) else {
                     // The peer made a file of a folder this Mac still has
                     // files in; the folder stays, and goes back to the peer.
-                    record = FileRecord(path: path, kind: .directory, version: Self.nextVersion(after: record.version), modified: Date().syncTimestamp)
+                    record = keptDirectory(at: path, over: action)
                     applied = .keptDirectory
                     break
                 }
                 try FileManager.default.removeItem(at: url)
+            }
+            if action.replacesConflictingFile {
+                try removeFile(url)
             }
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             if FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) {
@@ -795,13 +948,22 @@ public actor SyncEngine {
             } else {
                 // Something this Mac still has lives in it, so the directory
                 // stays, and goes back to the peer with it.
-                record = FileRecord(path: path, kind: .directory, version: Self.nextVersion(after: record.version), modified: Date().syncTimestamp)
+                record = keptDirectory(at: path, over: action)
                 applied = .keptDirectory
             }
         }
         index[path] = record
-        commit(index, for: item.id)
+        commit(index, for: item.id, changing: [path])
         return applied
+    }
+
+    /// The record of a directory at `path` kept although `action` would
+    /// have replaced it: a change by this Mac after both versions, so the
+    /// directory goes back to the peer.
+    private func keptDirectory(at path: String, over action: Action) -> FileRecord {
+        let now = Date().syncTimestamp
+        let seen = action.remote.version.merged(with: action.expected?.version ?? VersionVector())
+        return FileRecord(path: path, kind: .directory, version: seen.incremented(for: macID, now: now), changed: now, modified: now)
     }
 
     // MARK: - Helpers
@@ -830,8 +992,8 @@ public actor SyncEngine {
         return try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: anchor, create: true)
     }
 
-    /// The version a local change gets: now, or just after `previous` when
-    /// the clock says otherwise.
+    /// The version an item-list entry changed here gets: now, or just after
+    /// `previous` when the clock says otherwise.
     private static func nextVersion(after previous: SyncTimestamp?) -> SyncTimestamp {
         max(Date().syncTimestamp, (previous ?? 0) + 1)
     }
@@ -880,9 +1042,10 @@ public actor SyncEngine {
         path.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) && $0 != "\n" && $0 != "\t" }
     }
 
-    /// How far ahead of this Mac's clock a peer's timestamps may run.
-    /// Anything later is a broken clock or a broken peer, and would win
-    /// every conflict for years.
+    /// How far ahead of this Mac's clock a peer's timestamps — item-list
+    /// versions, change times, and version counters — may run. Anything
+    /// later is a broken clock or a broken peer, and would win every
+    /// conflict for years.
     static let maximumClockSkew: SyncTimestamp = 7 * 24 * 60 * 60 * 1000
 
     /// Whether `timestamp` is one a working Mac could have made by `now`.
@@ -890,11 +1053,11 @@ public actor SyncEngine {
         timestamp >= 0 && timestamp <= now + maximumClockSkew
     }
 
-    /// Whether a peer's `record` has a plausible version and size. Its
-    /// modification time can be anything a file system allows, including
-    /// before 1970.
+    /// Whether a peer's `record` has a plausible version, change time, and
+    /// size. Its modification time can be anything a file system allows,
+    /// including before 1970.
     static func isPlausible(_ record: FileRecord, now: SyncTimestamp) -> Bool {
-        isPlausible(record.version, now: now) && record.size >= 0
+        record.version.isPlausible(now: now) && isPlausible(record.changed, now: now) && record.size >= 0
     }
 
     /// Whether `path` is `ancestor` or inside it.

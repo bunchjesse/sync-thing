@@ -2,6 +2,8 @@ import Foundation
 
 /// A peer reached over HTTP through its tunnel's loopback port.
 struct HTTPSyncPeer: SyncPeer {
+    /// The peer's endpoint ID.
+    let id: String
     /// The tunnel's loopback address, `http://127.0.0.1:<port>`.
     let baseURL: URL
     /// The token the peer's host issued this Mac, sent with every request.
@@ -9,12 +11,14 @@ struct HTTPSyncPeer: SyncPeer {
     /// The session requests go through.
     let session: URLSession
 
-    /// Creates a peer whose tunnel listens on `port`, presenting `token`.
-    init(port: UInt16, token: String, session: URLSession = HTTPSyncPeer.session) {
+    /// Creates a peer, the Mac `id` names, whose tunnel listens on `port`,
+    /// presenting `token`.
+    init(id: String, port: UInt16, token: String, session: URLSession = HTTPSyncPeer.session) {
         var components = URLComponents()
         components.scheme = "http"
         components.host = "127.0.0.1"
         components.port = Int(port)
+        self.id = id
         self.baseURL = components.url ?? URL(filePath: "/")
         self.token = token
         self.session = session
@@ -38,10 +42,15 @@ struct HTTPSyncPeer: SyncPeer {
         return try JSONDecoder().decode([SyncItem].self, from: data)
     }
 
-    func records(forItem itemID: String) async throws -> [FileRecord]? {
-        let (data, response) = try await send(request(path: "v1/records", query: ["item": itemID]), allowing: [404])
+    func records(forItem itemID: String, after position: IndexPosition?) async throws -> RecordBatch? {
+        var query = ["item": itemID]
+        if let position {
+            query["index"] = position.index
+            query["after"] = String(position.sequence)
+        }
+        let (data, response) = try await send(request(path: "v1/records", query: query), allowing: [404])
         guard response.statusCode != 404 else { return nil }
-        return try JSONDecoder().decode([FileRecord].self, from: data)
+        return try JSONDecoder().decode(RecordBatch.self, from: data)
     }
 
     func download(itemID: String, path: String, to destination: URL) async throws {

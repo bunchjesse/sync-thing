@@ -22,22 +22,27 @@ they're on different networks.
   per Mac when its tunnel is admitted.
 - **Syncing is pull-based.** Each Mac pulls from every connected Mac when it
   connects, when that Mac says it changed (`POST /v1/changed`), and every
-  minute. Changes on disk are picked up with FSEvents, plus a full rescan at
-  launch, on wake, and every ten minutes.
-- **Conflicts**: newest wins, silently. Each file's version is its
-  modification time, capped at the scan's time so a file stamped in the future
-  can't outrank every later edit, and a file that replaces an older record
-  always goes after it. Ties break the same way on every Mac. Versions more
-  than a week ahead of this Mac's clock are ignored. A file whose contents
-  already match the winner is adopted without a download; one that was only
-  touched keeps its version.
-- **Deletions**: a deletion is dated by its folder's modification time — when
-  the entry went — not by when a scan noticed, so an edit made elsewhere in
-  the meantime still wins. Deleted files go to the Trash (or are removed
-  outright on a volume without one); a folder is removed only once it's
-  empty, and one holding files outranks a peer that replaced it with a file.
-  Deletions are remembered as tombstones for 90 days; a Mac away longer than
-  that may bring a deleted file back.
+  minute. A pull asks only for what changed since the last one; a Mac that
+  relaunched sends its whole index once. Changes on disk are picked up with
+  FSEvents, plus a full rescan at launch, on wake, and every ten minutes.
+- **Conflicts** are decided by what each Mac had seen, not by clocks. Every
+  file's version is a version vector: a counter per Mac that changed it. An
+  edit made after seeing another Mac's replaces it, whatever the modification
+  times say. Only edits made on two Macs before either saw the other's
+  conflict; then the later change wins everywhere, an edit always beats a
+  concurrent deletion, and ties break the same way on every Mac. Only the
+  Mac whose copy lost does anything: its copy goes to its Trash, where it
+  can be put back. Change times are capped at the scan's time, so a file
+  stamped in the future can't win every conflict, and times and counters
+  more than a week ahead of this Mac's clock are ignored. A file whose
+  contents already match the winner is adopted without a download; one that
+  was only touched keeps its version.
+- **Deletions** are a Mac's change like any other, so one made after seeing
+  an edit wins, and the edit goes to the Trash. Deleted files go to the Trash
+  (or are removed outright on a volume without one); a folder is removed only
+  once it's empty, and one holding files outranks a peer that replaced it
+  with a file. Deletions are remembered as tombstones for about fifteen
+  months; a Mac away longer than that may bring a deleted file back.
 - **A Mac joining** pulls the item list from each Mac it connects to and
   creates any missing folder. An item that reaches a copy this Mac already
   had — restored, cloned, or copied, so its modification times can't be
@@ -45,8 +50,8 @@ they're on different networks.
   for every such item, whether to use the other Macs' copies or this Mac's.
   The losing side's differing files go to its Trash. A copy with nothing the
   others lack syncs without asking. A folder added on two Macs separately,
-  before they met, isn't held: both copies are SyncThing's, and they merge
-  newest-wins. A pull that's interrupted resumes where
+  before they met, isn't held: both copies are SyncThing's, and their files
+  conflict like any concurrent edits. A pull that's interrupted resumes where
   it left off. Other Macs notice a new one when it first tells them it
   changed, or within 15 minutes, when they re-read the registry.
 - **Safety**: an item whose folder is missing on a Mac — an unmounted drive —

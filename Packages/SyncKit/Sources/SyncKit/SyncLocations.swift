@@ -1,7 +1,7 @@
 import Foundation
 
-/// Milliseconds since 1970, the unit every sync version and modification
-/// time is kept in.
+/// Milliseconds since 1970, the unit item versions, change times, and
+/// modification times are kept in.
 ///
 /// Whole milliseconds survive JSON, `Date`, and the file system's own
 /// timestamps unchanged, so a modification time copied from another Mac

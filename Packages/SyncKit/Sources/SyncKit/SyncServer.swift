@@ -15,7 +15,7 @@ import Synchronization
 /// | Request | Response |
 /// |---------|----------|
 /// | `GET /v1/items` | Every ``SyncItem``, including removed ones |
-/// | `GET /v1/records?item=<id>` | The item's ``FileRecord``s, or 404 when it isn't synced here, is missing, or is held for a ``JoinChoice`` |
+/// | `GET /v1/records?item=<id>[&index=<index>&after=<sequence>]` | A ``RecordBatch`` of the item's ``FileRecord``s — only those changed after the ``IndexPosition`` given, when it is in the current index — or 404 when the item isn't synced here, is missing, or is held for a ``JoinChoice`` |
 /// | `GET /v1/file?item=<id>&path=<path>` | The file's contents, or 404 when the records would be |
 /// | `POST /v1/changed` | 204; this Mac pulls from the caller soon |
 final class SyncServer: Sendable {
@@ -55,11 +55,18 @@ final class SyncServer: Sendable {
             try Self.json(await engine.allItems())
         }
         router.get("v1/records") { request, _ in
-            guard let itemID = request.uri.queryParameters["item"].map(String.init),
-                  let records = await engine.records(forItem: itemID) else {
+            let parameters = request.uri.queryParameters
+            guard let itemID = parameters["item"].map(String.init) else {
                 throw HTTPError(.notFound)
             }
-            return try Self.json(records)
+            let sequence = parameters["after"].flatMap { Int64($0) }.flatMap { $0 >= 0 ? $0 : nil }
+            let position = parameters["index"].flatMap { index in
+                sequence.map { IndexPosition(index: String(index), sequence: $0) }
+            }
+            guard let batch = await engine.records(forItem: itemID, after: position) else {
+                throw HTTPError(.notFound)
+            }
+            return try Self.json(batch)
         }
         router.get("v1/file") { request, context in
             guard let itemID = request.uri.queryParameters["item"].map(String.init),
