@@ -36,7 +36,10 @@ public struct SyncConfiguration: Sendable {
 /// found over Bonjour or at its published addresses, and through a relay
 /// when one is set — and pulls from it whenever it connects, when it says
 /// it changed, and every ``pullInterval``. When this Mac's files change it
-/// tells every connected Mac, which then pulls.
+/// tells every connected Mac, which then pulls. The registry is read at
+/// launch, on wake, every ``registryPollInterval``, and when a Mac it
+/// doesn't list yet says it changed. Items that reached copies this Mac
+/// already had wait for ``answerJoin(_:with:)``.
 @MainActor
 @Observable
 public final class SyncController {
@@ -63,14 +66,17 @@ public final class SyncController {
         public let isMissing: Bool
         /// How many files it holds here.
         public let fileCount: Int
+        /// Whether it waits for the user's ``JoinChoice`` before syncing.
+        public let isAwaitingChoice: Bool
 
         /// Creates an item state.
-        public init(id: String, kind: SyncItem.Kind, url: URL, isMissing: Bool, fileCount: Int) {
+        public init(id: String, kind: SyncItem.Kind, url: URL, isMissing: Bool, fileCount: Int, isAwaitingChoice: Bool = false) {
             self.id = id
             self.kind = kind
             self.url = url
             self.isMissing = isMissing
             self.fileCount = fileCount
+            self.isAwaitingChoice = isAwaitingChoice
         }
     }
 
@@ -123,6 +129,9 @@ public final class SyncController {
     public private(set) var relayStatus: RemoteNode.RelayStatus = .off
     /// The last error adding an item, for the UI to show once.
     public var lastAddError: String?
+    /// Items whose copies here differ from the other Macs', waiting for
+    /// ``answerJoin(_:)``.
+    public private(set) var joinQuestion: JoinQuestion?
 
     /// Whether any pull is under way.
     public var isSyncing: Bool { peers.contains(where: \.isSyncing) }
@@ -132,8 +141,13 @@ public final class SyncController {
     static let pullInterval: Duration = .seconds(60)
     /// How often every item is rescanned, in case FSEvents missed a change.
     static let rescanInterval: Duration = .seconds(600)
-    /// How often the registry is re-read for Macs iCloud Keychain delivered.
-    static let registryPollInterval: Duration = .seconds(15)
+    /// How often the registry is re-read for Macs that joined or left. It's
+    /// also read at launch, on wake, and when a Mac it doesn't list yet says
+    /// it changed.
+    static let registryPollInterval: Duration = .seconds(15 * 60)
+    /// The least time between registry reads that unknown Macs' change
+    /// announcements cause.
+    static let announcedRefreshInterval: Duration = .seconds(10)
     /// How long addresses must stay unchanged before they're published.
     static let addressSettleDelay: Duration = .seconds(3)
     /// How long changes gather before they're announced to peers.
@@ -151,11 +165,13 @@ public final class SyncController {
     @ObservationIgnored private var watcher: FileWatcher?
     @ObservationIgnored private var identity: DeviceIdentity?
     @ObservationIgnored private var node: RemoteNode?
+    @ObservationIgnored private var registry: DeviceRegistry?
     @ObservationIgnored private var sessions: [String: PeerSession] = [:]
     @ObservationIgnored private var tasks: [Task<Void, Never>] = []
     @ObservationIgnored private var pendingAnnounce: Task<Void, Never>?
     @ObservationIgnored private var pendingAddressPublish: Task<Void, Never>?
     @ObservationIgnored private var lastPublish: Task<Void, Never>?
+    @ObservationIgnored private var lastAnnouncedRefresh: ContinuousClock.Instant?
     @ObservationIgnored private var isRefreshingItems = false
     @ObservationIgnored private var needsItemsRefresh = false
     @ObservationIgnored private var isStarted = false
@@ -175,7 +191,7 @@ public final class SyncController {
         return [remote.keychainServicePrefix, remote.localInstance, key].compactMap(\.self).joined(separator: ".")
     }
 
-    private init(previewItems: [ItemState], peers: [PeerState], relayAddress: String?) {
+    private init(previewItems: [ItemState], peers: [PeerState], relayAddress: String?, joinQuestion: JoinQuestion?) {
         self.configuration = nil
         self.defaults = .standard
         self.status = .running
@@ -183,11 +199,12 @@ public final class SyncController {
         self.peers = peers
         self.relayAddress = relayAddress
         self.relayStatus = relayAddress == nil ? .off : .registered
+        self.joinQuestion = joinQuestion
     }
 
     /// A controller showing fixed state that never syncs, for previews.
-    public static func preview(items: [ItemState], peers: [PeerState], relayAddress: String? = nil) -> SyncController {
-        SyncController(previewItems: items, peers: peers, relayAddress: relayAddress)
+    public static func preview(items: [ItemState], peers: [PeerState], relayAddress: String? = nil, joinQuestion: JoinQuestion? = nil) -> SyncController {
+        SyncController(previewItems: items, peers: peers, relayAddress: relayAddress, joinQuestion: joinQuestion)
     }
 
     // MARK: - Lifecycle
@@ -207,7 +224,7 @@ public final class SyncController {
             }
 
             let server = SyncServer(engine: engine, tokens: tokens) { [weak self] endpointID in
-                Task { @MainActor in self?.sessions[endpointID]?.requestPull() }
+                Task { @MainActor in await self?.peerChanged(endpointID) }
             }
             self.server = server
             try await server.start()
@@ -221,6 +238,7 @@ public final class SyncController {
             let remote = configuration.remoteAccess
             let store = SystemKeychainStore(accessGroup: remote.keychainAccessGroup)
             let registry = DeviceRegistry(store: store, configuration: remote)
+            self.registry = registry
             let identity = try await Self.offMain { try DeviceIdentity.loadOrCreate(store: store, configuration: remote) }
             self.identity = identity
             let portKey = Self.defaultsKey(Self.listeningPortKey, for: configuration)
@@ -235,8 +253,8 @@ public final class SyncController {
             status = .running
             Self.log.notice("Syncing as \(identity.endpointID.prefix(12), privacy: .public)")
             await publishThisMac(registry: registry)
-            await refreshPeers(registry: registry)
-            startTimers(registry: registry)
+            await refreshPeers()
+            startTimers()
             await rescanAndAnnounce()
         } catch {
             Self.log.error("Syncing unavailable: \(error.localizedDescription, privacy: .public)")
@@ -256,6 +274,7 @@ public final class SyncController {
         watcher = nil
         server = nil
         node = nil
+        registry = nil
         engine = nil
     }
 
@@ -288,6 +307,14 @@ public final class SyncController {
         }
     }
 
+    /// Settles the items in `question` — the one the user answered — by
+    /// `choice`, then syncs.
+    public func answerJoin(_ question: JoinQuestion, with choice: JoinChoice) async {
+        await engine?.answerJoin(choice, itemIDs: question.items.map(\.id))
+        await refreshItems()
+        syncNow()
+    }
+
     /// Registers this Mac with the relay at `address` (`host` or `host:port`),
     /// or with none when it's empty. Returns false, changing nothing, when
     /// `address` isn't a valid relay address.
@@ -316,8 +343,8 @@ public final class SyncController {
 
     /// Re-reads the registry: links to Macs that joined, drops ones that
     /// left, and hands record changes to the links.
-    private func refreshPeers(registry: DeviceRegistry) async {
-        guard let identity, let node, let engine else { return }
+    private func refreshPeers() async {
+        guard let identity, let node, let engine, let registry else { return }
         let records: [DeviceRecord]
         do {
             records = try await Self.offMain { try registry.records() }
@@ -352,12 +379,28 @@ public final class SyncController {
         }
     }
 
+    /// Pulls from `endpointID`, which said it changed. A Mac with no link
+    /// is new, so the registry is read again — at most once per
+    /// ``announcedRefreshInterval`` — which links to it and pulls.
+    private func peerChanged(_ endpointID: String) async {
+        if let session = sessions[endpointID] {
+            session.requestPull()
+            return
+        }
+        let now = ContinuousClock.now
+        if let last = lastAnnouncedRefresh, now - last < Self.announcedRefreshInterval { return }
+        lastAnnouncedRefresh = now
+        await refreshPeers()
+    }
+
     // MARK: - Changes
 
     private func engineChanged(_ event: SyncEngine.Event) {
         Task { await refreshItems() }
-        if case .availabilityChanged = event { return }
-        announceSoon()
+        switch event {
+        case .availabilityChanged, .joinQuestionChanged: return
+        case .itemsChanged, .filesChanged: announceSoon()
+        }
     }
 
     /// Rescans the items FSEvents says changed.
@@ -407,11 +450,16 @@ public final class SyncController {
                     kind: item.kind,
                     url: engine.url(for: item),
                     isMissing: await engine.isMissing(item.id),
-                    fileCount: await engine.fileCount(item.id)
+                    fileCount: await engine.fileCount(item.id),
+                    isAwaitingChoice: await engine.isAwaitingChoice(item.id)
                 ))
             }
             if states != items {
                 items = states
+            }
+            let question = await engine.joinQuestion()
+            if question != joinQuestion {
+                joinQuestion = question
             }
             watcher?.watch(states.map { (id: $0.id, url: $0.url, isFile: $0.kind == .file) })
         } while needsItemsRefresh
@@ -456,11 +504,11 @@ public final class SyncController {
         }
     }
 
-    private func startTimers(registry: DeviceRegistry) {
+    private func startTimers() {
         tasks.append(Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: Self.registryPollInterval)
-                await self?.refreshPeers(registry: registry)
+                await self?.refreshPeers()
             }
         })
         tasks.append(Task { [weak self] in
@@ -481,7 +529,7 @@ public final class SyncController {
                 Self.log.notice("Woke; reconnecting")
                 self.node?.restartDiscovery()
                 self.sessions.values.forEach { $0.reconnect() }
-                await self.refreshPeers(registry: registry)
+                await self.refreshPeers()
                 await self.rescanAndAnnounce()
             }
         })

@@ -242,4 +242,10 @@ extension TestMac {
     func pull(from other: TestMac) async throws -> SyncReport {
         try await engine.pull(from: EnginePeer(engine: other.engine))
     }
+
+    /// Answers the join question the engine asks now, as the menu does.
+    func answer(_ choice: JoinChoice) async {
+        let itemIDs = await engine.joinQuestion()?.items.map(\.id) ?? []
+        await engine.answerJoin(choice, itemIDs: itemIDs)
+    }
 }

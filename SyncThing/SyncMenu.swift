@@ -16,6 +16,12 @@ struct SyncMenu: View {
                     .foregroundStyle(.secondary)
                     .font(.callout)
             }
+            if let question = controller.joinQuestion {
+                JoinSection(question: question) { choice in
+                    Task { await controller.answerJoin(question, with: choice) }
+                }
+                Divider()
+            }
             ItemsSection(controller: controller)
             Divider()
             PeersSection(peers: controller.peers)
@@ -32,6 +38,52 @@ struct SyncMenu: View {
             Button("OK") {}
         } message: { message in
             Text(message)
+        }
+    }
+}
+
+/// Asks which copies win when items from the other Macs reached copies this
+/// Mac already had: one answer for every item, confirmed before anything
+/// moves to the Trash.
+private struct JoinSection: View {
+    /// The items the answer settles.
+    let question: JoinQuestion
+    /// Called with the confirmed answer.
+    let answer: (JoinChoice) -> Void
+    /// The answer waiting for confirmation.
+    @State private var pending: JoinChoice?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("This Mac Already Has Copies", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                .font(.headline)
+            Text("These differ from your other Macs. Choose which copies to keep; the others go to the Trash.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(question.items) { item in
+                Text("\(item.id) · \(item.differingFiles.formatted()) \(item.differingFiles == 1 ? "file differs" : "files differ")")
+                    .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            HStack {
+                Button("Use Other Macs’ Copies") { pending = .useOtherMacs }
+                Button("Use This Mac’s") { pending = .useThisMac }
+            }
+        }
+        .confirmationDialog(
+            pending == .useThisMac ? "Replace the files on your other Macs?" : "Replace the files on this Mac?",
+            isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } }),
+            presenting: pending
+        ) { choice in
+            Button(choice == .useThisMac ? "Use This Mac’s Copies" : "Use Other Macs’ Copies", role: .destructive) {
+                answer(choice)
+            }
+        } message: { choice in
+            Text(choice == .useThisMac
+                ? "Your other Macs’ files that differ, or that this Mac doesn’t have, go to their Trash."
+                : "This Mac’s files that differ, or that your other Macs don’t have, go to the Trash.")
         }
     }
 }
@@ -118,6 +170,9 @@ private struct ItemRow: View {
     private var detail: String {
         if item.isMissing {
             return "Not on this Mac — paused"
+        }
+        if item.isAwaitingChoice {
+            return "Already on this Mac — waiting to compare"
         }
         guard item.kind == .folder else { return item.id }
         return "\(item.id) · \(item.fileCount.formatted()) \(item.fileCount == 1 ? "file" : "files")"
@@ -294,4 +349,18 @@ private enum PreviewData {
 
 #Preview("Empty") {
     SyncMenu(controller: .preview(items: [], peers: []))
+}
+
+#Preview("Joining") {
+    SyncMenu(controller: .preview(
+        items: [
+            SyncController.ItemState(id: "~/Documents/Notes", kind: .folder, url: URL(filePath: "/Users/me/Documents/Notes"), isMissing: false, fileCount: 240, isAwaitingChoice: true),
+            SyncController.ItemState(id: "~/.zshrc", kind: .file, url: URL(filePath: "/Users/me/.zshrc"), isMissing: false, fileCount: 1, isAwaitingChoice: true),
+        ],
+        peers: PreviewData.peers,
+        joinQuestion: JoinQuestion(items: [
+            JoinQuestion.Item(id: "~/.zshrc", differingFiles: 1),
+            JoinQuestion.Item(id: "~/Documents/Notes", differingFiles: 12),
+        ])
+    ))
 }

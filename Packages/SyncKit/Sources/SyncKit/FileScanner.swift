@@ -175,11 +175,10 @@ enum FileScanner {
 
     /// The record for the file at `url`: the previous one when the file is
     /// unchanged, otherwise a new version. A file with no history takes its
-    /// modification time as its version, so the newer copy wins when two
-    /// Macs first meet; one that replaces an older record goes after it,
-    /// even when its modification time is older, as a restored or copied
-    /// file's is. Nil when the file can't be read, which the scan treats as
-    /// unknown rather than deleted.
+    /// modification time as its version; one that replaces an older record
+    /// goes after it, even when its modification time is older, as a
+    /// restored or copied file's is. Nil when the file can't be read, which
+    /// the scan treats as unknown rather than deleted.
     private static func fileRecord(path: String, url: URL, values: URLResourceValues, previous: FileRecord?, now: SyncTimestamp) -> FileRecord? {
         guard let fileSize = values.fileSize, let modifiedDate = values.contentModificationDate else { return nil }
         let size = Int64(fileSize)

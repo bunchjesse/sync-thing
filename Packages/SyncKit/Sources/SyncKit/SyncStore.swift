@@ -49,6 +49,20 @@ struct SyncStore: Sendable {
         try? FileManager.default.removeItem(at: indexURL(itemID: itemID))
     }
 
+    /// The items waiting for the user's ``JoinChoice``; empty when none are,
+    /// or when the file can't be read.
+    func loadAwaitingChoice() -> Set<String> {
+        load(Set<String>.self, from: awaitingChoiceURL) ?? []
+    }
+
+    /// Saves the items waiting for the user's ``JoinChoice``.
+    func save(awaitingChoice: Set<String>) throws {
+        try Self.encoder.encode(awaitingChoice.sorted()).write(to: awaitingChoiceURL, options: .atomic)
+    }
+
+    /// The file listing the items waiting for a ``JoinChoice``.
+    private var awaitingChoiceURL: URL { directory.appending(path: "awaiting-choice.json") }
+
     /// The file holding `itemID`'s index, named by a hash of the ID since
     /// the ID is a path.
     private func indexURL(itemID: String) -> URL {

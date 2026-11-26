@@ -30,7 +30,8 @@ the Macs on one Apple Account. See `README.md` for the design.
   other through `EnginePeer` (`TestSupport.swift`; `FaultyPeer` injects
   failures). Suites are split by scenario: `NewMacTests`, `ConflictTests`,
   `ItemTests`, `DegenerateInputTests`, `FailureTests`; add new sync behavior
-  tests to the matching one.
+  tests to the matching one. Joining and the `JoinChoice` question belong in
+  `NewMacTests`.
 - Use `ago(_:)` for test modification times: versions are capped at now, so a
   future time doesn't win.
 
@@ -42,6 +43,9 @@ the Macs on one Apple Account. See `README.md` for the design.
   records.
 - Compare and name paths by `SyncLocations.realPath`/`portablePath`, which
   resolve links, `/private`, and case, never by the spelling given.
+- An item that reaches a copy this Mac already had is held for the user's
+  `JoinChoice` (`SyncEngine.awaitingChoice`): never pull into it or serve it
+  until `answerJoin` settles it.
 - Every path a peer sends goes through `SyncEngine.isSafe(path:in:)` or
   `isSafeItemID` before touching disk, every write and read goes through
   `hasNoLinks(below:to:includingTarget:)`, and every peer timestamp through

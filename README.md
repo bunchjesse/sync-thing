@@ -39,10 +39,16 @@ they're on different networks.
   Deletions are remembered as tombstones for 90 days; a Mac away longer than
   that may bring a deleted file back.
 - **A Mac joining** pulls the item list from each Mac it connects to and
-  creates any missing folder. What it already has is merged by the same
-  rules: matching files are adopted, the newer copy wins — an older copy here
-  is overwritten, not trashed — and its own files reach the others on their
-  next pull. A pull that's interrupted resumes where it left off.
+  creates any missing folder. An item that reaches a copy this Mac already
+  had — restored, cloned, or copied, so its modification times can't be
+  trusted — is held: it isn't pulled into or served, and the menu asks once,
+  for every such item, whether to use the other Macs' copies or this Mac's.
+  The losing side's differing files go to its Trash. A copy with nothing the
+  others lack syncs without asking. A folder added on two Macs separately,
+  before they met, isn't held: both copies are SyncThing's, and they merge
+  newest-wins. A pull that's interrupted resumes where
+  it left off. Other Macs notice a new one when it first tells them it
+  changed, or within 15 minutes, when they re-read the registry.
 - **Safety**: an item whose folder is missing on a Mac — an unmounted drive —
   or whose single file became a folder or a link pauses there instead of
   deleting the files everywhere, and a folder or file that can't be read keeps

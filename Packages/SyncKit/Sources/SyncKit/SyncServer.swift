@@ -15,8 +15,8 @@ import Synchronization
 /// | Request | Response |
 /// |---------|----------|
 /// | `GET /v1/items` | Every ``SyncItem``, including removed ones |
-/// | `GET /v1/records?item=<id>` | The item's ``FileRecord``s, or 404 when it isn't synced here |
-/// | `GET /v1/file?item=<id>&path=<path>` | The file's contents, or 404 |
+/// | `GET /v1/records?item=<id>` | The item's ``FileRecord``s, or 404 when it isn't synced here, is missing, or is held for a ``JoinChoice`` |
+/// | `GET /v1/file?item=<id>&path=<path>` | The file's contents, or 404 when the records would be |
 /// | `POST /v1/changed` | 204; this Mac pulls from the caller soon |
 final class SyncServer: Sendable {
     /// The port the server is listening on, once it is.

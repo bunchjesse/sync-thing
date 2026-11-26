@@ -12,22 +12,25 @@ struct SyncThingApp: App {
         MenuBarExtra {
             SyncMenu(controller: controller)
         } label: {
-            MenuBarIcon(isSyncing: controller.isSyncing)
+            MenuBarIcon(isSyncing: controller.isSyncing, needsChoice: controller.joinQuestion != nil)
                 .task { await controller.start() }
         }
         .menuBarExtraStyle(.window)
     }
 }
 
-/// The menu bar icon, which spins while files are syncing.
+/// The menu bar icon, which spins while files are syncing and shows an
+/// exclamation mark while items wait for the user's choice.
 struct MenuBarIcon: View {
     /// Whether a pull is under way.
     let isSyncing: Bool
+    /// Whether items wait for the user to choose which copies win.
+    let needsChoice: Bool
 
     var body: some View {
-        Image(systemName: "arrow.triangle.2.circlepath")
+        Image(systemName: needsChoice ? "exclamationmark.arrow.triangle.2.circlepath" : "arrow.triangle.2.circlepath")
             .symbolEffect(.rotate, isActive: isSyncing)
-            .accessibilityLabel(isSyncing ? "SyncThing, syncing" : "SyncThing")
+            .accessibilityLabel(needsChoice ? "SyncThing, needs your choice" : isSyncing ? "SyncThing, syncing" : "SyncThing")
     }
 }
 

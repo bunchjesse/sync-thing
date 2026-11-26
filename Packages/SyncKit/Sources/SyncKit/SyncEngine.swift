@@ -6,7 +6,9 @@ import os
 ///
 /// The engine never pushes. ``pull(from:)`` downloads whatever a peer has
 /// that is newer — newest change wins, path by path — and the peer pulls
-/// from this Mac in turn when told something changed (``Event``).
+/// from this Mac in turn when told something changed (``Event``). An item
+/// that reaches a copy this Mac already had is held, neither pulled into
+/// nor served, until the user answers ``joinQuestion()``.
 ///
 /// Scanning, hashing, and downloading run off the actor, so it can take
 /// other calls meanwhile; every change to an index is therefore checked
@@ -25,6 +27,8 @@ public actor SyncEngine {
         case filesChanged(itemID: String)
         /// An item's root went missing or came back.
         case availabilityChanged(itemID: String)
+        /// ``joinQuestion()`` changed.
+        case joinQuestionChanged
     }
 
     /// Where portable paths point on this Mac.
@@ -41,6 +45,11 @@ public actor SyncEngine {
     private var scanning: Set<String> = []
     private var rescanRequested: Set<String> = []
     private var dirtyIndexes: Set<String> = []
+    /// Items that reached copies this Mac already had, held back — neither
+    /// pulled into nor served — until the user makes a ``JoinChoice``.
+    private var awaitingChoice: Set<String>
+    /// The latest index a peer served of each item in ``awaitingChoice``.
+    private var peerRecords: [String: [String: FileRecord]] = [:]
     private var observer: (@Sendable (Event) -> Void)?
 
     private static let log = Logger(subsystem: "dev.bunch.SyncKit", category: "engine")
@@ -62,6 +71,7 @@ public actor SyncEngine {
         self.store = store
         let loaded = store.loadItems()
         self.items = Dictionary(loaded.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        self.awaitingChoice = store.loadAwaitingChoice()
         for item in loaded where !item.isRemoved {
             indexes[item.id] = store.loadIndex(itemID: item.id)
         }
@@ -213,7 +223,7 @@ public actor SyncEngine {
             if item.isRemoved {
                 forgetIndex(item.id)
             } else if current == nil {
-                createRootIfNew(item)
+                prepareRoot(for: item)
                 added.append(item)
             }
         }
@@ -224,13 +234,24 @@ public actor SyncEngine {
         return added
     }
 
-    /// Creates the folder an item with no index on this Mac lives in, so it
-    /// can be filled. An item with an index is never given a new root: that
-    /// it's gone means a drive isn't mounted, or the user moved it, and the
-    /// item waits rather than syncing into a new, empty folder.
-    private func createRootIfNew(_ item: SyncItem) {
+    /// Readies the root of an item new to this Mac that has no index here.
+    /// A missing root is created so it can be filled; one that already
+    /// holds a copy is held for the user's ``JoinChoice``, since a copy made
+    /// outside SyncThing has modification times that can't say which files
+    /// are newer. An item with an index is left alone: a missing root then
+    /// means a drive isn't mounted, or the user moved it, and the item waits
+    /// rather than syncing into a new, empty folder.
+    private func prepareRoot(for item: SyncItem) {
         guard indexes[item.id] == nil, store.loadIndex(itemID: item.id) == nil else { return }
         let root = url(for: item)
+        let exists = FileManager.default.fileExists(atPath: root.path(percentEncoded: false))
+        let isFolder = FileScanner.isDirectory(root)
+        let holdsCopy = exists && (item.kind == .folder ? isFolder && !Self.isEffectivelyEmpty(root) : !isFolder)
+        if holdsCopy {
+            awaitingChoice.insert(item.id)
+            saveAwaitingChoice()
+            return
+        }
         let folder = item.kind == .folder ? root : root.deletingLastPathComponent()
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -239,12 +260,28 @@ public actor SyncEngine {
         }
     }
 
+    /// Drops everything this Mac knows about `itemID`'s files, as when it
+    /// stops being synced. The files stay.
     private func forgetIndex(_ itemID: String) {
         indexes[itemID] = nil
         generations[itemID, default: 0] += 1
         missingRoots.remove(itemID)
         dirtyIndexes.remove(itemID)
         store.removeIndex(itemID: itemID)
+        peerRecords[itemID] = nil
+        if awaitingChoice.remove(itemID) != nil {
+            saveAwaitingChoice()
+            observer?(.joinQuestionChanged)
+        }
+    }
+
+    /// Saves which items are held, so they stay held across a relaunch.
+    private func saveAwaitingChoice() {
+        do {
+            try store.save(awaitingChoice: awaitingChoice)
+        } catch {
+            Self.log.error("Couldn't save the items awaiting a choice: \(error.localizedDescription, privacy: .private)")
+        }
     }
 
     private func saveItems() {
@@ -326,17 +363,20 @@ public actor SyncEngine {
     // MARK: - Serving
 
     /// This Mac's index of `itemID`, for a peer to pull, or nil while the
-    /// item isn't synced here or its root is missing.
+    /// item isn't synced here, its root is missing, or it awaits the user's
+    /// ``JoinChoice``.
     public func records(forItem itemID: String) -> [FileRecord]? {
-        guard items[itemID]?.isRemoved == false, !missingRoots.contains(itemID), let index = indexes[itemID] else { return nil }
+        guard items[itemID]?.isRemoved == false, !missingRoots.contains(itemID), !awaitingChoice.contains(itemID),
+              let index = indexes[itemID] else { return nil }
         return index.values.sorted { $0.path < $1.path }
     }
 
     /// The file a peer may download at `path` in `itemID`: only a file this
     /// Mac's index lists, reached without following a symbolic link inside
-    /// the item, so a request can never reach outside it.
+    /// the item, so a request can never reach outside it. Nil wherever
+    /// ``records(forItem:)`` is.
     public func servableFile(itemID: String, path: String) -> URL? {
-        guard let item = items[itemID], !item.isRemoved, !missingRoots.contains(itemID),
+        guard let item = items[itemID], !item.isRemoved, !missingRoots.contains(itemID), !awaitingChoice.contains(itemID),
               Self.isSafe(path: path, in: item),
               let record = indexes[itemID]?[path], record.kind == .file, !record.isDeleted else { return nil }
         let file = fileURL(in: item, path: path)
@@ -361,9 +401,183 @@ public actor SyncEngine {
             }
             guard indexes[item.id] != nil, !missingRoots.contains(item.id) else { continue }
             guard let remote = try await peer.records(forItem: item.id) else { continue }
+            if awaitingChoice.contains(item.id), !hold(item, remote: remote) { continue }
             try await pull(item, records: remote, from: peer, into: &report)
         }
         return report
+    }
+
+    // MARK: - Joining
+
+    /// The items awaiting the user's ``JoinChoice`` whose copies differ from
+    /// the other Macs', or nil until a peer has served one of them.
+    public func joinQuestion() -> JoinQuestion? {
+        let items = awaitingChoice.sorted().compactMap { itemID -> JoinQuestion.Item? in
+            guard let local = indexes[itemID], let remote = peerRecords[itemID] else { return nil }
+            return JoinQuestion.Item(id: itemID, differingFiles: Self.differences(local, remote).files)
+        }
+        return items.isEmpty ? nil : JoinQuestion(items: items)
+    }
+
+    /// Whether `itemID` awaits the user's ``JoinChoice``.
+    public func isAwaitingChoice(_ itemID: String) -> Bool {
+        awaitingChoice.contains(itemID)
+    }
+
+    /// Settles the items `itemIDs` names — those the user was asked about —
+    /// by `choice`, each after a rescan so the answer applies to what is on
+    /// disk now. An item that can't be settled fully stays held. The next
+    /// pull brings the other Macs' files; with ``JoinChoice/useThisMac``, the
+    /// other Macs' next pulls take this Mac's.
+    public func answerJoin(_ choice: JoinChoice, itemIDs: [String]) async {
+        for itemID in itemIDs where awaitingChoice.contains(itemID) {
+            await rescan(itemID: itemID)
+            guard let item = items[itemID], !item.isRemoved, !missingRoots.contains(itemID) else { continue }
+            settle(item, by: choice)
+        }
+    }
+
+    /// Adds `remote`, a peer's index of `item`, which awaits the user's
+    /// choice, to what the other Macs are known to have: path by path, the
+    /// record that wins. Returns whether the item can sync now — when this
+    /// Mac has nothing the others lack, there is nothing to choose, and
+    /// their copy is taken.
+    private func hold(_ item: SyncItem, remote: [FileRecord]) -> Bool {
+        var records = peerRecords[item.id] ?? [:]
+        let previous = records
+        for record in Self.admissible(remote, in: item) where records[record.path].map(record.supersedes) ?? true {
+            records[record.path] = record
+        }
+        peerRecords[item.id] = records
+        if let local = indexes[item.id], Self.differences(local, records).localFiles == 0, settle(item, by: .useOtherMacs) {
+            return true
+        }
+        if previous != records {
+            observer?(.joinQuestionChanged)
+        }
+        return false
+    }
+
+    /// How many files differ between `local` and `remote`, one side's
+    /// missing file counting like a deleted one, and how many of those are
+    /// live on this Mac and would be lost by taking the peer's copy.
+    private static func differences(_ local: [String: FileRecord], _ remote: [String: FileRecord]) -> (files: Int, localFiles: Int) {
+        var files = 0
+        var localFiles = 0
+        for path in Set(local.keys).union(remote.keys) {
+            let mine = local[path].flatMap { $0.isDeleted ? nil : $0 }
+            let theirs = remote[path].flatMap { $0.isDeleted ? nil : $0 }
+            if let mine, let theirs, mine.hasSameContent(as: theirs) { continue }
+            if mine?.kind == .file || theirs?.kind == .file { files += 1 }
+            if mine?.kind == .file { localFiles += 1 }
+        }
+        return (files, localFiles)
+    }
+
+    /// Makes `item`'s copy here and the other Macs' (``peerRecords``) agree
+    /// on which wins, as ``JoinChoice`` describes, then syncs it like any
+    /// other. Returns whether it did. When a file can't be settled — it
+    /// won't move to the Trash, or changed since the rescan — what was done
+    /// is kept and the item stays held.
+    @discardableResult
+    private func settle(_ item: SyncItem, by choice: JoinChoice) -> Bool {
+        guard var index = indexes[item.id], let remote = peerRecords[item.id] else { return false }
+        var isComplete = true
+        switch choice {
+        case .useThisMac:
+            // Versions after every Mac's, and tombstones for what only
+            // they have, so this copy wins everywhere.
+            let now = Date().syncTimestamp
+            for path in Set(index.keys).union(remote.keys) {
+                let mine = index[path].flatMap { $0.isDeleted ? nil : $0 }
+                let theirs = remote[path].flatMap { $0.isDeleted ? nil : $0 }
+                if let mine, let theirs, mine.hasSameContent(as: theirs) { continue }
+                let version = max(now, (remote[path]?.version ?? 0) + 1, (index[path]?.version ?? 0) + 1)
+                if var mine {
+                    mine.version = version
+                    index[path] = mine
+                } else if let theirs {
+                    index[path] = theirs.deleted(at: version)
+                }
+            }
+        case .useOtherMacs:
+            // This Mac's differing files go to the Trash and its records
+            // give way, so the next pull fills their places; files go
+            // first, then the folders they emptied, deepest first.
+            let root = url(for: item)
+            let directories = index.values.filter { $0.kind == .directory }.map(\.path).sorted { $0.count > $1.count }
+            let files = index.values.filter { $0.kind == .file }.map(\.path)
+            for path in files + directories {
+                guard let mine = index[path] else { continue }
+                let theirs = remote[path]
+                let given = theirs?.isDeleted == true ? theirs : nil
+                if mine.isDeleted {
+                    index[path] = given
+                    continue
+                }
+                let url = fileURL(in: item, path: path)
+                guard Self.hasNoLinks(below: root, to: url, includingTarget: true) else {
+                    isComplete = false
+                    continue
+                }
+                if let theirs, !theirs.isDeleted, mine.hasSameContent(as: theirs) {
+                    var adopted = theirs
+                    if theirs.kind == .file {
+                        guard Self.disk(at: url, matches: mine), let (modified, size) = try? Self.setModified(theirs.modified, of: url) else {
+                            isComplete = false
+                            continue
+                        }
+                        (adopted.modified, adopted.size) = (modified, size)
+                    }
+                    index[path] = adopted
+                    continue
+                }
+                do {
+                    if mine.kind == .file {
+                        try removeFile(url)
+                    } else if Self.isEffectivelyEmpty(url) {
+                        try FileManager.default.removeItem(at: url)
+                    } else {
+                        // Something SyncThing doesn't sync, such as a link,
+                        // is still in it; the folder stays for it.
+                        continue
+                    }
+                } catch {
+                    Self.log.error("Couldn't move \(path, privacy: .private) aside: \(error.localizedDescription, privacy: .private)")
+                    isComplete = false
+                    continue
+                }
+                index[path] = given
+            }
+        }
+        commit(index, for: item.id)
+        flush(item.id)
+        observer?(.filesChanged(itemID: item.id))
+        guard isComplete else {
+            Self.log.error("Couldn't settle all of \(item.id, privacy: .private); it stays held")
+            return false
+        }
+        awaitingChoice.remove(item.id)
+        peerRecords[item.id] = nil
+        saveAwaitingChoice()
+        Self.log.notice("Settled \(item.id, privacy: .private) by \(String(describing: choice), privacy: .public)")
+        observer?(.joinQuestionChanged)
+        return true
+    }
+
+    /// The records in a peer's `remote` index of `item` that this Mac will
+    /// consider: those with safe paths and plausible sizes and timestamps.
+    private static func admissible(_ remote: [FileRecord], in item: SyncItem) -> [FileRecord] {
+        let now = Date().syncTimestamp
+        return remote.filter { isSafe(path: $0.path, in: item) && isPlausible($0, now: now) }
+    }
+
+    /// Makes `index` `itemID`'s index, to be saved by the next ``flush(_:)``,
+    /// and marks scans that started before it stale.
+    private func commit(_ index: [String: FileRecord], for itemID: String) {
+        indexes[itemID] = index
+        generations[itemID, default: 0] += 1
+        dirtyIndexes.insert(itemID)
     }
 
     /// One change a pull will make, and the local record it was planned
@@ -478,7 +692,7 @@ public actor SyncEngine {
         let local = indexes[item.id] ?? [:]
         let now = Date().syncTimestamp
         var actions: [Action] = []
-        for record in remote where Self.isSafe(path: record.path, in: item) && Self.isPlausible(record, now: now) {
+        for record in Self.admissible(remote, in: item) {
             let current = local[record.path]
             let isExpired = record.isDeleted && now - record.version >= FileScanner.tombstoneLifetime
             if isExpired, current == nil || current?.isDeleted == true { continue }
@@ -527,9 +741,7 @@ public actor SyncEngine {
                 throw CocoaError(.fileWriteNoPermission, userInfo: [NSFilePathErrorKey: url.path(percentEncoded: false)])
             }
             index[path] = action.remote
-            indexes[item.id] = index
-            generations[item.id, default: 0] += 1
-            dirtyIndexes.insert(item.id)
+            commit(index, for: item.id)
             return .recorded
         }
         guard Self.disk(at: url, matches: action.expected) else {
@@ -588,9 +800,7 @@ public actor SyncEngine {
             }
         }
         index[path] = record
-        indexes[item.id] = index
-        generations[item.id, default: 0] += 1
-        dirtyIndexes.insert(item.id)
+        commit(index, for: item.id)
         return applied
     }
 

@@ -130,3 +130,41 @@ public struct FileRecord: Codable, Sendable, Hashable {
         return kind == .directory || hash == other.hash
     }
 }
+
+/// Which copies win when items from the other Macs reach copies this Mac
+/// already had before it synced them.
+public enum JoinChoice: Sendable {
+    /// This Mac takes the other Macs' files. Its own that differ, or that
+    /// only it has, go to the Trash.
+    case useOtherMacs
+    /// The other Macs take this Mac's files. Theirs that differ are
+    /// replaced, and files only they have go to their Trash.
+    case useThisMac
+}
+
+/// The items whose copies on this Mac, made before it synced them, differ
+/// from the other Macs', waiting for a ``JoinChoice``.
+public struct JoinQuestion: Sendable, Hashable {
+    /// One item whose copies differ.
+    public struct Item: Sendable, Hashable, Identifiable {
+        /// The item's portable path.
+        public let id: String
+        /// How many files differ between this Mac and the others,
+        /// counting files only one side has.
+        public let differingFiles: Int
+
+        /// Creates an item.
+        public init(id: String, differingFiles: Int) {
+            self.id = id
+            self.differingFiles = differingFiles
+        }
+    }
+
+    /// The items whose copies differ, sorted by path.
+    public let items: [Item]
+
+    /// Creates a question.
+    public init(items: [Item]) {
+        self.items = items
+    }
+}
