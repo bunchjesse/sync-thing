@@ -10,6 +10,11 @@ on the local network with Bonjour, and can optionally meet through a
 [rendezvous relay](https://github.com/bunchjesse/rendezvous-relay) when
 they're on different networks.
 
+The menu bar icon lists the ten most recently changed synced files; click one
+to open it, or hold Option to show it in Finder. **Open SyncThing** opens the
+window where you add and remove folders and files, see your other Macs, and
+set the relay and Open at Login.
+
 ## How it works
 
 - **Discovery and trust** come from
@@ -46,7 +51,7 @@ they're on different networks.
 - **A Mac joining** pulls the item list from each Mac it connects to and
   creates any missing folder. An item that reaches a copy this Mac already
   had — restored, cloned, or copied, so its modification times can't be
-  trusted — is held: it isn't pulled into or served, and the menu asks once,
+  trusted — is held: it isn't pulled into or served, and the window asks once,
   for every such item, whether to use the other Macs' copies or this Mac's.
   The losing side's differing files go to its Trash. A copy with nothing the
   others lack syncs without asking. A folder added on two Macs separately,
@@ -79,7 +84,7 @@ Finder and Spotlight keep in folders.
 
 | Path | What |
 |------|------|
-| `SyncThing/` | The app: `MenuBarExtra`, menu UI, and per-build configuration |
+| `SyncThing/` | The app: the menu bar menu (`StatusMenu`), the window (`SyncWindow`), the icon (`AppIcon.icon`), and per-build configuration |
 | `Packages/SyncKit/` | Everything else: scanner, engine, store, HTTP server and client, watcher, and `SyncController` |
 
 ## Building
@@ -93,6 +98,10 @@ Run the SyncKit tests with:
 ```sh
 swift test --package-path Packages/SyncKit
 ```
+
+`.symphony/skills/release/scripts/release.sh` builds a notarized Developer
+ID release into `~/Downloads/SyncThing-<version>/`; the `release` skill
+beside it walks through the version bump and commit around it.
 
 ### Debug builds
 
@@ -111,7 +120,8 @@ open -n --env SYNCTHING_INSTANCE=b --env SYNCTHING_HOME=/tmp/b "$APP"
 
 ### Relay
 
-The relay is off by default. To use one, enter its `host[:port]` in the menu.
+The relay is off by default. To use one, enter its `host[:port]` in the
+SyncThing window's Options.
 The relay must allow the build's namespace — for the deployment in
 `personal-site`, add `dev.bunch.SyncThing` and `dev.bunch.SyncThing.debug` to
 `RELAY_ALLOWED_NAMESPACES`.

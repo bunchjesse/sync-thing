@@ -293,3 +293,20 @@ public struct JoinQuestion: Sendable, Hashable {
         self.items = items
     }
 }
+
+/// A synced file that changed recently, here or on another Mac.
+public struct RecentFile: Identifiable, Hashable, Sendable {
+    /// Where the file is on this Mac.
+    public let url: URL
+    /// When the file changed.
+    public let changed: Date
+
+    /// The file's location, which no other synced file shares.
+    public var id: URL { url }
+
+    /// Creates a recent file.
+    public init(url: URL, changed: Date) {
+        self.url = url
+        self.changed = changed
+    }
+}

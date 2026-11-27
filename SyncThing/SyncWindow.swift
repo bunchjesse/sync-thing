@@ -3,33 +3,33 @@ import ServiceManagement
 import SwiftUI
 import SyncKit
 
-/// The window the menu bar icon opens: what's synced, the other Macs, and
-/// a few settings.
-struct SyncMenu: View {
-    /// The controller whose state the menu shows.
+/// SyncThing's window: what's synced, the other Macs, and the settings.
+struct SyncWindow: View {
+    /// The identifier of the window's scene, for opening it.
+    static let id = "main"
+
+    /// The controller whose state the window shows.
     let controller: SyncController
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        Form {
             if case .unavailable(let reason) = controller.status {
-                Label(reason, systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.secondary)
-                    .font(.callout)
+                Section {
+                    Label(reason, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.secondary)
+                }
             }
             if let question = controller.joinQuestion {
                 JoinSection(question: question) { choice in
                     Task { await controller.answerJoin(question, with: choice) }
                 }
-                Divider()
             }
             ItemsSection(controller: controller)
-            Divider()
             PeersSection(peers: controller.peers)
-            Divider()
-            SettingsSection(controller: controller)
+            OptionsSection(controller: controller)
         }
-        .padding(14)
-        .frame(width: 340)
+        .formStyle(.grouped)
+        .frame(minWidth: 440, minHeight: 400)
         .alert(
             "Couldn't Sync That",
             isPresented: Binding(get: { controller.lastAddError != nil }, set: { if !$0 { controller.lastAddError = nil } }),
@@ -54,23 +54,22 @@ private struct JoinSection: View {
     @State private var pending: JoinChoice?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("This Mac Already Has Copies", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
-                .font(.headline)
-            Text("These differ from your other Macs. Choose which copies to keep; the others go to the Trash.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+        Section {
             ForEach(question.items) { item in
-                Text("\(item.id) · \(item.differingFiles.formatted()) \(item.differingFiles == 1 ? "file differs" : "files differ")")
-                    .font(.caption)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                LabeledContent(item.id) {
+                    Text("\(item.differingFiles.formatted()) \(item.differingFiles == 1 ? "file differs" : "files differ")")
+                }
             }
             HStack {
+                Spacer()
                 Button("Use Other Macs’ Copies") { pending = .useOtherMacs }
                 Button("Use This Mac’s") { pending = .useThisMac }
             }
+        } header: {
+            Label("This Mac Already Has Copies", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+        } footer: {
+            Text("These differ from your other Macs. Choose which copies to keep; the others go to the Trash.")
+                .foregroundStyle(.secondary)
         }
         .confirmationDialog(
             pending == .useThisMac ? "Replace the files on your other Macs?" : "Replace the files on this Mac?",
@@ -93,14 +92,10 @@ private struct ItemsSection: View {
     let controller: SyncController
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Syncing")
-                .font(.headline)
+        Section("Syncing") {
             if controller.items.isEmpty {
                 Text("Nothing yet. Anything you add here syncs to all your Macs.")
-                    .font(.callout)
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(controller.items) { item in
                     ItemRow(item: item) {
@@ -108,10 +103,11 @@ private struct ItemsSection: View {
                     }
                 }
             }
-            Button("Add Folder or File…", systemImage: "plus") {
-                chooseItems()
+            HStack {
+                Spacer()
+                Button("Add Folder or File…", systemImage: "plus", action: chooseItems)
+                    .disabled(controller.status != .running)
             }
-            .disabled(controller.status != .running)
         }
     }
 
@@ -123,7 +119,6 @@ private struct ItemsSection: View {
         panel.showsHiddenFiles = true
         panel.prompt = "Sync"
         panel.message = "Choose folders or files to keep the same on all your Macs."
-        NSApp.activate()
         guard panel.runModal() == .OK else { return }
         let urls = panel.urls
         Task { await controller.add(urls) }
@@ -151,12 +146,7 @@ private struct ItemRow: View {
             }
             Spacer(minLength: 0)
             Menu {
-                Button("Show in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([item.url])
-                }
-                .disabled(item.isMissing)
-                Divider()
-                Button("Stop Syncing", role: .destructive, action: remove)
+                actions
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
@@ -165,6 +155,17 @@ private struct ItemRow: View {
             .fixedSize()
             .accessibilityLabel("Options for \(item.url.lastPathComponent)")
         }
+        .contextMenu { actions }
+    }
+
+    /// The row's actions, in both its menu and its context menu.
+    @ViewBuilder private var actions: some View {
+        Button("Show in Finder") {
+            NSWorkspace.shared.activateFileViewerSelecting([item.url])
+        }
+        .disabled(item.isMissing)
+        Divider()
+        Button("Stop Syncing", role: .destructive, action: remove)
     }
 
     private var detail: String {
@@ -184,14 +185,10 @@ private struct PeersSection: View {
     let peers: [SyncController.PeerState]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Macs")
-                .font(.headline)
+        Section("Macs") {
             if peers.isEmpty {
                 Text("Open SyncThing on another Mac signed in to the same Apple Account.")
-                    .font(.callout)
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(peers) { peer in
                     PeerRow(peer: peer)
@@ -259,44 +256,46 @@ private struct PeerRow: View {
     }
 }
 
-/// The relay, Open at Login, Sync Now, and Quit.
-private struct SettingsSection: View {
+/// The relay, Open at Login, and Sync Now.
+private struct OptionsSection: View {
     let controller: SyncController
     @State private var relay = ""
     @State private var relayIsInvalid = false
     @State private var opensAtLogin = SMAppService.mainApp.status == .enabled
+    @FocusState private var relayIsFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            LabeledContent("Relay") {
-                TextField("None", text: $relay, prompt: Text("relay.example.com"))
-                    .textFieldStyle(.roundedBorder)
+        Section("Options") {
+            VStack(alignment: .leading, spacing: 4) {
+                TextField("Relay", text: $relay, prompt: Text("relay.example.com"))
+                    .focused($relayIsFocused)
                     .onSubmit(applyRelay)
-                    .help("Optional. Reaches Macs on other networks through a rendezvous relay.")
-            }
-            if relayIsInvalid {
-                Text("That isn't a host or host:port.")
+                    .onChange(of: relayIsFocused) { _, isFocused in
+                        if !isFocused { applyRelay() }
+                    }
+                Text(relayCaption)
                     .font(.caption)
-                    .foregroundStyle(.red)
-            } else if controller.relayAddress != nil {
-                Text(relayStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(relayIsInvalid ? Color.red : Color.secondary)
             }
             Toggle("Open at Login", isOn: Binding(get: { opensAtLogin }, set: setOpensAtLogin))
-            HStack {
+            LabeledContent("Pull from your other Macs now") {
                 Button("Sync Now") { controller.syncNow() }
                     .disabled(controller.peers.isEmpty)
-                Spacer()
-                Button("Quit SyncThing") { NSApp.terminate(nil) }
-                    .keyboardShortcut("q")
             }
         }
         .onAppear { relay = controller.relayAddress ?? "" }
     }
 
-    private var relayStatus: String {
-        switch controller.relayStatus {
+    /// The line under the relay field: why the entry was refused, how the
+    /// relay is doing, or what a relay is for when none is set.
+    private var relayCaption: String {
+        if relayIsInvalid {
+            return "That isn't a host or host:port."
+        }
+        guard controller.relayAddress != nil else {
+            return "Optional. Reaches Macs on other networks through a rendezvous relay."
+        }
+        return switch controller.relayStatus {
         case .off: "Relay off"
         case .connecting: "Connecting to relay…"
         case .registered: "Registered with relay"
@@ -304,7 +303,13 @@ private struct SettingsSection: View {
         }
     }
 
+    /// Saves the relay field when it differs from the saved relay, so
+    /// leaving the field unchanged doesn't reconnect.
     private func applyRelay() {
+        guard relay != (controller.relayAddress ?? "") else {
+            relayIsInvalid = false
+            return
+        }
         relayIsInvalid = !controller.setRelayAddress(relay)
         if !relayIsInvalid {
             relay = controller.relayAddress ?? ""
@@ -329,6 +334,7 @@ private struct SettingsSection: View {
     }
 }
 
+/// Sample state for previews.
 private enum PreviewData {
     static let items: [SyncController.ItemState] = [
         SyncController.ItemState(id: "~/Documents/Notes", kind: .folder, url: URL(filePath: "/Users/me/Documents/Notes"), isMissing: false, fileCount: 248),
@@ -344,15 +350,15 @@ private enum PreviewData {
 }
 
 #Preview("Syncing") {
-    SyncMenu(controller: .preview(items: PreviewData.items, peers: PreviewData.peers, relayAddress: "relay.bunch.dev:3340"))
+    SyncWindow(controller: .preview(items: PreviewData.items, peers: PreviewData.peers, relayAddress: "relay.bunch.dev:3340"))
 }
 
 #Preview("Empty") {
-    SyncMenu(controller: .preview(items: [], peers: []))
+    SyncWindow(controller: .preview(items: [], peers: []))
 }
 
 #Preview("Joining") {
-    SyncMenu(controller: .preview(
+    SyncWindow(controller: .preview(
         items: [
             SyncController.ItemState(id: "~/Documents/Notes", kind: .folder, url: URL(filePath: "/Users/me/Documents/Notes"), isMissing: false, fileCount: 240, isAwaitingChoice: true),
             SyncController.ItemState(id: "~/.zshrc", kind: .file, url: URL(filePath: "/Users/me/.zshrc"), isMissing: false, fileCount: 1, isAwaitingChoice: true),

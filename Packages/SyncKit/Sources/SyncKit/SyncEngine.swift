@@ -139,6 +139,30 @@ public actor SyncEngine {
         indexes[itemID]?.values.count { $0.kind == .file && !$0.isDeleted } ?? 0
     }
 
+    /// The `limit` synced files that changed most recently, here or on
+    /// another Mac, newest first. Items that are paused or wait for a
+    /// ``JoinChoice`` are left out, as are files reached through a link.
+    public func recentFiles(limit: Int) -> [RecentFile] {
+        let files = activeItems()
+            .filter { !missingRoots.contains($0.id) && !awaitingChoice.contains($0.id) }
+            .flatMap { item in
+                (indexes[item.id] ?? [:]).values
+                    .filter { $0.kind == .file && !$0.isDeleted }
+                    .map { (item: item, record: $0) }
+            }
+        let newestFirst = files.sorted { lhs, rhs in
+            if lhs.record.changed != rhs.record.changed { return lhs.record.changed > rhs.record.changed }
+            return (lhs.item.id, lhs.record.path) < (rhs.item.id, rhs.record.path)
+        }
+        var recent: [RecentFile] = []
+        for (item, record) in newestFirst where recent.count < limit {
+            let file = fileURL(in: item, path: record.path)
+            guard Self.hasNoLinks(below: url(for: item), to: file, includingTarget: true) else { continue }
+            recent.append(RecentFile(url: file, changed: Date(syncTimestamp: record.changed)))
+        }
+        return recent
+    }
+
     /// Where `item` lives on this Mac.
     public nonisolated func url(for item: SyncItem) -> URL {
         locations.url(forPortablePath: item.id)

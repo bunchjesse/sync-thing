@@ -5,15 +5,19 @@ the Macs on one Apple Account. See `README.md` for the design.
 
 ## Layout
 
-- `SyncThing/` — the app target. Keep it thin: the `MenuBarExtra`, the menu
-  view, and `SyncConfiguration.current`.
+- `SyncThing/` — the app target. Keep it thin: `SyncThingApp` (the
+  `MenuBarExtra` and the window scene; its `AppDelegate` owns the
+  `SyncController`), `StatusMenu` (recent files, Open, Quit), `SyncWindow`
+  (items, Macs, the join question, and options), `AppIcon.icon` (an Icon
+  Composer icon with SVG layers), and `SyncConfiguration.current`.
 - `Packages/SyncKit/` — all logic, so it can be tested with `swift test`:
   - `SyncLocations`, `SyncModel` — portable paths, timestamps, records, and the
     conflict rules: `VersionVector` orders a path's versions, and
     `FileRecord.winsConflict(over:)` decides between concurrent ones.
   - `FileScanner` — builds an item's index from disk.
   - `SyncEngine` — the actor that owns items and indexes, rescans, and pulls
-    from a `SyncPeer`, asking only for what changed (`IndexPosition`).
+    from a `SyncPeer`, asking only for what changed (`IndexPosition`). It also
+    lists the newest files for the menu (`recentFiles(limit:)`).
   - `SyncStore` — JSON state under Application Support.
   - `SyncServer` / `HTTPSyncPeer` — the loopback HTTP API (`/v1/…`) and its
     client.
@@ -23,7 +27,9 @@ the Macs on one Apple Account. See `README.md` for the design.
 ## Building and testing
 
 - Build and run the app with the Xcode MCP tools (`BuildProject`,
-  `RunProject`), not `xcodebuild`.
+  `RunProject`), not `xcodebuild`. The exception is releasing: use the
+  `release` skill (`.symphony/skills/release/`), whose script archives and
+  notarizes with `xcodebuild`.
 - The project uses the text `project.xcproj` format. Change build settings,
   Info.plist keys, and entitlements with the Xcode tools, not by hand.
 - Test SyncKit with `swift test --package-path Packages/SyncKit`. Tests use

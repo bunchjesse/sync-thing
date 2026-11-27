@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 import SyncKit
@@ -6,31 +7,49 @@ import SyncKit
 /// signed in to this Apple Account.
 @main
 struct SyncThingApp: App {
-    @State private var controller = SyncController(configuration: .current)
+    @NSApplicationDelegateAdaptor private var appDelegate: AppDelegate
 
     var body: some Scene {
         MenuBarExtra {
-            SyncMenu(controller: controller)
+            StatusMenu(controller: appDelegate.controller)
         } label: {
-            MenuBarIcon(isSyncing: controller.isSyncing, needsChoice: controller.joinQuestion != nil)
-                .task { await controller.start() }
+            MenuBarIcon(controller: appDelegate.controller)
         }
-        .menuBarExtraStyle(.window)
+        .menuBarExtraStyle(.menu)
+
+        Window("SyncThing", id: SyncWindow.id) {
+            SyncWindow(controller: appDelegate.controller)
+        }
+        .defaultSize(width: 520, height: 640)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+        .windowResizability(.contentMinSize)
+    }
+}
+
+/// Owns the controller and starts syncing at launch, whether or not the
+/// menu or the window is ever opened.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// The controller every scene shows.
+    let controller = SyncController(configuration: .current)
+
+    /// Starts syncing.
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        Task { await controller.start() }
     }
 }
 
 /// The menu bar icon, which spins while files are syncing and shows an
 /// exclamation mark while items wait for the user's choice.
 struct MenuBarIcon: View {
-    /// Whether a pull is under way.
-    let isSyncing: Bool
-    /// Whether items wait for the user to choose which copies win.
-    let needsChoice: Bool
+    /// The controller whose state the icon shows.
+    let controller: SyncController
 
     var body: some View {
+        let needsChoice = controller.joinQuestion != nil
         Image(systemName: needsChoice ? "exclamationmark.arrow.triangle.2.circlepath" : "arrow.triangle.2.circlepath")
-            .symbolEffect(.rotate, isActive: isSyncing)
-            .accessibilityLabel(needsChoice ? "SyncThing, needs your choice" : isSyncing ? "SyncThing, syncing" : "SyncThing")
+            .symbolEffect(.rotate, isActive: controller.isSyncing)
+            .accessibilityLabel(needsChoice ? "SyncThing, needs your choice" : controller.isSyncing ? "SyncThing, syncing" : "SyncThing")
     }
 }
 

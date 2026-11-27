@@ -325,7 +325,7 @@ struct SyncEngineTests {
             records: [
                 fileRecord("a.txt", "theirs", changed: .max),
                 fileRecord("b.txt", "theirs", changed: .min),
-                fileRecord("c.txt", "theirs", changed: now + SyncEngine.maximumClockSkew + 1),
+                fileRecord("c.txt", "theirs", changed: now + SyncEngine.maximumClockSkew + 60_000),
             ],
             contents: ["a.txt": "theirs", "b.txt": "theirs", "c.txt": "theirs"]
         )
@@ -515,5 +515,61 @@ struct SyncEngineTests {
 
         #expect(report.deleted == 0)
         #expect(laptop.read("Notes/Private/a.txt") == "x")
+    }
+
+    /// The recent files are the newest live files across every item, a
+    /// pulled one included, newest first and no more than asked for;
+    /// folders, deletions, and paused items are left out.
+    @Test func recentFilesAreTheNewestAcrossItems() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let studio = try TestMac(named: "studio", in: directory)
+        let laptop = try TestMac(named: "laptop", in: directory)
+        let (pulled, zshrc, old) = (ago(100), ago(300), ago(500))
+        try studio.write("old", to: "Notes/old.txt", modified: old)
+        try studio.write("gone", to: "Notes/gone.txt", modified: ago(10))
+        try studio.write("export PATH", to: ".zshrc", modified: zshrc)
+        try studio.write("paused", to: "Drive/paused.txt", modified: ago(5))
+        try FileManager.default.createDirectory(at: studio.url("Notes/Empty"), withIntermediateDirectories: true)
+        try await studio.engine.addItem(at: studio.url("Notes"))
+        try await studio.engine.addItem(at: studio.url(".zshrc"))
+        try await studio.engine.addItem(at: studio.url("Drive"))
+        try await laptop.pull(from: studio)
+        try laptop.write("from laptop", to: "Notes/pulled.txt", modified: pulled)
+        await laptop.engine.rescanAll()
+        try await studio.pull(from: laptop)
+
+        try studio.remove("Notes/gone.txt")
+        try FileManager.default.moveItem(at: studio.url("Drive"), to: studio.url("Unmounted"))
+        await studio.engine.rescanAll()
+        let recent = await studio.engine.recentFiles(limit: 10)
+        let newest = await studio.engine.recentFiles(limit: 2)
+
+        #expect(recent == [
+            RecentFile(url: studio.url("Notes/pulled.txt"), changed: pulled),
+            RecentFile(url: studio.url(".zshrc"), changed: zshrc),
+            RecentFile(url: studio.url("Notes/old.txt"), changed: old),
+        ])
+        #expect(newest == Array(recent.prefix(2)))
+    }
+
+    /// A recent file whose folder was replaced by a link keeps its record,
+    /// but isn't listed, so the menu can't open what the link leads to.
+    @Test func recentFilesSkipPathsThroughLinks() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let studio = try TestMac(named: "studio", in: directory)
+        let plain = ago(200)
+        try studio.write("plain", to: "Notes/plain.txt", modified: plain)
+        try studio.write("inside", to: "Notes/Sub/inside.txt", modified: ago(100))
+        try studio.write("elsewhere", to: "Elsewhere/inside.txt", modified: ago(50))
+        try await studio.engine.addItem(at: studio.url("Notes"))
+
+        try FileManager.default.removeItem(at: studio.url("Notes/Sub"))
+        try FileManager.default.createSymbolicLink(at: studio.url("Notes/Sub"), withDestinationURL: studio.url("Elsewhere"))
+        await studio.engine.rescanAll()
+
+        #expect(await studio.engine.fileCount("~/Notes") == 2)
+        #expect(await studio.engine.recentFiles(limit: 10) == [RecentFile(url: studio.url("Notes/plain.txt"), changed: plain)])
     }
 }

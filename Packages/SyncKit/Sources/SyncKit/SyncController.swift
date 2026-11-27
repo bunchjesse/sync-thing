@@ -132,9 +132,15 @@ public final class SyncController {
     /// Items whose copies here differ from the other Macs', waiting for
     /// ``answerJoin(_:)``.
     public private(set) var joinQuestion: JoinQuestion?
+    /// The synced files that changed most recently, newest first, at most
+    /// ``recentFileLimit``.
+    public private(set) var recentFiles: [RecentFile] = []
 
     /// Whether any pull is under way.
     public var isSyncing: Bool { peers.contains(where: \.isSyncing) }
+
+    /// How many files ``recentFiles`` lists.
+    static let recentFileLimit = 10
 
     /// How often every connected Mac is pulled from, in case a change
     /// announcement was missed.
@@ -469,6 +475,10 @@ public final class SyncController {
             let question = await engine.joinQuestion()
             if question != joinQuestion {
                 joinQuestion = question
+            }
+            let recent = await engine.recentFiles(limit: Self.recentFileLimit)
+            if recent != recentFiles {
+                recentFiles = recent
             }
             watcher?.watch(states.map { (id: $0.id, url: $0.url, isFile: $0.kind == .file) })
         } while needsItemsRefresh

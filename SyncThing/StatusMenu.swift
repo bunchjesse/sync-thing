@@ -1,0 +1,86 @@
+import AppKit
+import SwiftUI
+import SyncKit
+
+/// The menu the menu bar icon opens: the synced files that changed most
+/// recently, and the way into SyncThing's window.
+struct StatusMenu: View {
+    /// The controller whose state the menu shows.
+    let controller: SyncController
+
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        if case .unavailable(let reason) = controller.status {
+            Text(reason)
+            Divider()
+        }
+        if controller.joinQuestion != nil {
+            Button("Choose Which Copies to Keep…", systemImage: "exclamationmark.arrow.triangle.2.circlepath", action: openSyncThing)
+            Divider()
+        }
+        Section("Recently Changed") {
+            if controller.recentFiles.isEmpty {
+                Text("No synced files yet")
+            } else {
+                ForEach(controller.recentFiles) { file in
+                    RecentFileItem(file: file)
+                }
+            }
+        }
+        .labelStyle(.titleAndIcon)
+        Divider()
+        Button("Open SyncThing", action: openSyncThing)
+            .keyboardShortcut("o")
+        Divider()
+        Button("Quit SyncThing") { NSApp.terminate(nil) }
+            .keyboardShortcut("q")
+    }
+
+    /// Opens SyncThing's window and brings the app forward.
+    private func openSyncThing() {
+        openWindow(id: SyncWindow.id)
+        NSApp.activate()
+    }
+}
+
+/// One recently changed file, which opens when chosen, or is shown in the
+/// Finder when chosen with Option held.
+private struct RecentFileItem: View {
+    /// The file the item opens.
+    let file: RecentFile
+
+    var body: some View {
+        Button {
+            NSWorkspace.shared.open(file.url)
+        } label: {
+            Label { Text(file.url.lastPathComponent) } icon: { Image(nsImage: icon) }
+            Text(detail)
+        }
+        .modifierKeyAlternate(.option) {
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([file.url])
+            } label: {
+                Label("Show \(file.url.lastPathComponent) in Finder", systemImage: "folder")
+                Text(detail)
+            }
+        }
+    }
+
+    /// The file's Finder icon, at menu size.
+    private var icon: NSImage {
+        let icon = NSWorkspace.shared.icon(forFile: file.url.path(percentEncoded: false))
+        icon.size = NSSize(width: 16, height: 16)
+        return icon
+    }
+
+    /// The folder the file is in, and when it changed: the time for today,
+    /// otherwise the date, so it stays right while the menu is open.
+    private var detail: String {
+        let folder = (file.url.deletingLastPathComponent().path(percentEncoded: false) as NSString).abbreviatingWithTildeInPath
+        let changed = Calendar.current.isDateInToday(file.changed)
+            ? file.changed.formatted(date: .omitted, time: .shortened)
+            : file.changed.formatted(date: .abbreviated, time: .omitted)
+        return "\(folder) · \(changed)"
+    }
+}
