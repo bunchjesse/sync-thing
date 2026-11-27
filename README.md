@@ -117,10 +117,9 @@ checking once a day; the menu offers an update a check found, and the window
 has the automatic-check setting. Sparkle orders builds by
 `CURRENT_PROJECT_VERSION`, so every release raises it. Updates are signed
 with an EdDSA key whose public half is `SUPublicEDKey` in `Info.plist`; the
-private half is the "Private key for signing Sparkle updates" item for
-account `bunch.dev` in the login Keychain. Keep a backup of it
-(`generate_keys --account bunch.dev -x <file>`, from Sparkle's `bin/`):
-without it no installed copy accepts another update.
+private half is `~/Documents/SigningKeys/SyncThing/sparkle-private-key.txt`,
+outside the repository and the Keychain. Keep a backup of it: without it no
+installed copy accepts another update.
 
 ### Debug builds
 

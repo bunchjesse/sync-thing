@@ -77,7 +77,8 @@ Only when the user says to publish:
      `main`, or a build that isn't newer than the published appcast's,
    - downloads the published `appcast.xml` and runs Sparkle's
      `generate_appcast` (from the Sparkle package's artifacts in
-     DerivedData) with the `bunch.dev` key from the login Keychain, which
+     DerivedData) with the key in
+     `~/Documents/SigningKeys/SyncThing/sparkle-private-key.txt`, which
      signs the zip and adds an entry with the notes embedded,
    - pushes `main` and `v<version>`, creates the GitHub release with the zip
      and the new `appcast.xml`, and marks it latest,
@@ -108,13 +109,11 @@ Only when the user says to publish:
 - **Couldn't list the releases or download appcast.xml**: `gh` isn't logged
   in to github.com or the network is down. The script stops rather than
   publish an appcast without the earlier builds.
-- **The Keychain asks to let `generate_appcast` use the key**: the user has
-  to allow it; it's the "Private key for signing Sparkle updates" item for
-  account `bunch.dev`.
-- **No signing key**: the key is gone from this Mac's Keychain. Never make a
-  new one — installed copies only trust the public key in `Info.plist`
-  (`SUPublicEDKey`). Ask the user to import their backup with Sparkle's
-  `generate_keys --account bunch.dev -f <file>`.
+- **No Sparkle signing key**: the key file is missing from
+  `~/Documents/SigningKeys/SyncThing/`. Never make a new one — installed
+  copies only trust the public key in `Info.plist` (`SUPublicEDKey`). Ask
+  the user to restore `sparkle-private-key.txt` from their backup. Don't
+  put the key in the Keychain; the user doesn't want its password prompts.
 
 ## Notes
 

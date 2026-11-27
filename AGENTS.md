@@ -93,8 +93,9 @@ the Macs on one Apple Account. See `README.md` for the design.
   offered a Release build.
 - Every published build raises `CURRENT_PROJECT_VERSION`; Sparkle orders
   builds by it. Never generate a new Sparkle key: installed copies trust
-  only `SUPublicEDKey`, and the private key is the `bunch.dev` item in the
-  login Keychain.
+  only `SUPublicEDKey`. The private key is
+  `~/Documents/SigningKeys/SyncThing/sparkle-private-key.txt`; never commit
+  it or put it in the Keychain.
 - The Bonjour types must stay listed in `NSBonjourServices`.
 - Nothing has shipped yet: change the HTTP API and saved formats freely,
   keep the routes at `/v1`, and don't add migrations or compatibility code

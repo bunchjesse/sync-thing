@@ -14,9 +14,11 @@ root=${2:-$(git rev-parse --show-toplevel)}
 cd "$root"
 repo=bunchjesse/sync-thing
 feed=https://github.com/$repo/releases/latest/download/appcast.xml
-account=bunch.dev
+key=~/Documents/SigningKeys/SyncThing/sparkle-private-key.txt
 
 fail() { print -u2 "publish: $*"; exit 1; }
+
+[[ -s $key ]] || fail "no Sparkle signing key at $key"
 
 folder=~/Downloads/SyncThing-$version
 archive=$folder/SyncThing-$version.zip
@@ -47,7 +49,7 @@ if (( releases > 0 )); then
 fi
 
 cp $archive $notes $work/
-$tools/generate_appcast --account $account --embed-release-notes \
+$tools/generate_appcast --ed-key-file $key --embed-release-notes \
     --download-url-prefix "https://github.com/$repo/releases/download/v$version/" \
     --link "https://github.com/$repo" $work
 grep -q "<sparkle:version>$build</sparkle:version>" $work/appcast.xml || fail "the appcast has no entry for build $build"
