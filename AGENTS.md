@@ -7,8 +7,10 @@ the Macs on one Apple Account. See `README.md` for the design.
 
 - `SyncThing/` — the app target. Keep it thin: `SyncThingApp` (the
   `MenuBarExtra` and the window scene; its `AppDelegate` owns the
-  `SyncController`), `StatusMenu` (recent files, Open, Quit), `SyncWindow`
-  (items, Macs, the join question, and options), `AppIcon.icon` and
+  `SyncController` and the `Updater`), `StatusMenu` (recent files, Open,
+  Check for Updates, Quit), `SyncWindow` (items, Macs, the join question,
+  options, and updates), `Updater` (Sparkle's `SPUStandardUpdaterController`
+  with gentle reminders, since the app has no Dock icon), `AppIcon.icon` and
   `AppIconDebug.icon` (Icon Composer icons with SVG layers), and
   `SyncConfiguration.current`.
 - `Packages/SyncKit/` — all logic, so it can be tested with `swift test`:
@@ -31,8 +33,15 @@ the Macs on one Apple Account. See `README.md` for the design.
   `RunProject`), not `xcodebuild`. The exception is releasing: use the
   `release` skill (`.symphony/skills/release/`), whose script archives and
   notarizes with `xcodebuild`.
+- Building a release and publishing it are separate. `release.sh` stays on
+  this Mac; `publish.sh` pushes and creates the GitHub release that every
+  installed copy updates from. Only publish when the user says "publish".
 - The project uses the text `project.xcproj` format. Change build settings,
-  Info.plist keys, and entitlements with the Xcode tools, not by hand.
+  Info.plist keys, and entitlements with the Xcode tools, not by hand. The
+  exceptions are `[config=…]` settings and package references, which the
+  tools can't write; after any tool change, check `git diff`, since Xcode's
+  save can collapse `[config=…]` pairs and rename the product to
+  `SyncThingDebug.app`.
 - Test SyncKit with `swift test --package-path Packages/SyncKit`. Tests use
   Swift Testing, and every test has a `///` comment saying what it checks.
 - Engine tests run several `SyncEngine`s in temporary directories against each
@@ -80,6 +89,12 @@ the Macs on one Apple Account. See `README.md` for the design.
   `SyncThing` in both. The Keychain access group follows
   `$(PRODUCT_BUNDLE_IDENTIFIER)`. `AppIconDebug.icon` keeps its own copy of
   `arrows.svg`; change both icons together.
+- Debug builds never start Sparkle (`Updater.isEnabled`), so they're never
+  offered a Release build.
+- Every published build raises `CURRENT_PROJECT_VERSION`; Sparkle orders
+  builds by it. Never generate a new Sparkle key: installed copies trust
+  only `SUPublicEDKey`, and the private key is the `bunch.dev` item in the
+  login Keychain.
 - The Bonjour types must stay listed in `NSBonjourServices`.
 - Nothing has shipped yet: change the HTTP API and saved formats freely,
   keep the routes at `/v1`, and don't add migrations or compatibility code

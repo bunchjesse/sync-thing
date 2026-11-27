@@ -10,6 +10,8 @@ struct SyncWindow: View {
 
     /// The controller whose state the window shows.
     let controller: SyncController
+    /// The updater whose settings the window shows.
+    let updater: Updater
 
     var body: some View {
         Form {
@@ -27,6 +29,7 @@ struct SyncWindow: View {
             ItemsSection(controller: controller)
             PeersSection(peers: controller.peers)
             OptionsSection(controller: controller)
+            UpdatesSection(updater: updater)
         }
         .formStyle(.grouped)
         .frame(minWidth: 440, minHeight: 400)
@@ -334,6 +337,35 @@ private struct OptionsSection: View {
     }
 }
 
+/// Whether and when SyncThing updates itself, and the version running.
+private struct UpdatesSection: View {
+    let updater: Updater
+
+    var body: some View {
+        @Bindable var updater = updater
+        Section("Updates") {
+            if Updater.isEnabled {
+                Toggle("Check for Updates Automatically", isOn: $updater.automaticallyChecksForUpdates)
+            }
+            LabeledContent {
+                Button("Check Now", action: updater.checkForUpdates)
+                    .disabled(!updater.canCheckForUpdates)
+            } label: {
+                Text("SyncThing \(Self.version)")
+                Text(Updater.isEnabled ? "Updates come from github.com/bunchjesse/sync-thing." : "Debug builds don't update themselves.")
+            }
+        }
+    }
+
+    /// The running version and build, such as "0.1 (2)".
+    private static var version: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let short = info["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info["CFBundleVersion"] as? String ?? "?"
+        return "\(short) (\(build))"
+    }
+}
+
 /// Sample state for previews.
 private enum PreviewData {
     static let items: [SyncController.ItemState] = [
@@ -350,11 +382,11 @@ private enum PreviewData {
 }
 
 #Preview("Syncing") {
-    SyncWindow(controller: .preview(items: PreviewData.items, peers: PreviewData.peers, relayAddress: "relay.bunch.dev:3340"))
+    SyncWindow(controller: .preview(items: PreviewData.items, peers: PreviewData.peers, relayAddress: "relay.bunch.dev:3340"), updater: Updater())
 }
 
 #Preview("Empty") {
-    SyncWindow(controller: .preview(items: [], peers: []))
+    SyncWindow(controller: .preview(items: [], peers: []), updater: Updater())
 }
 
 #Preview("Joining") {
@@ -368,5 +400,5 @@ private enum PreviewData {
             JoinQuestion.Item(id: "~/.zshrc", differingFiles: 1),
             JoinQuestion.Item(id: "~/Documents/Notes", differingFiles: 12),
         ])
-    ))
+    ), updater: Updater())
 }

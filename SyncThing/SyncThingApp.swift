@@ -11,14 +11,14 @@ struct SyncThingApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            StatusMenu(controller: appDelegate.controller)
+            StatusMenu(controller: appDelegate.controller, updater: appDelegate.updater)
         } label: {
             MenuBarIcon(controller: appDelegate.controller)
         }
         .menuBarExtraStyle(.menu)
 
         Window("SyncThing", id: SyncWindow.id) {
-            SyncWindow(controller: appDelegate.controller)
+            SyncWindow(controller: appDelegate.controller, updater: appDelegate.updater)
         }
         .defaultSize(width: 520, height: 640)
         .defaultLaunchBehavior(.suppressed)
@@ -27,11 +27,13 @@ struct SyncThingApp: App {
     }
 }
 
-/// Owns the controller and starts syncing at launch, whether or not the
-/// menu or the window is ever opened.
+/// Owns the controller and the updater, and starts syncing at launch,
+/// whether or not the menu or the window is ever opened.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The controller every scene shows.
     let controller = SyncController(configuration: .current)
+    /// Keeps the app up to date.
+    let updater = Updater()
 
     /// Starts syncing.
     func applicationDidFinishLaunching(_ notification: Notification) {

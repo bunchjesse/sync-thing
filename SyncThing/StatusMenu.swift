@@ -3,14 +3,20 @@ import SwiftUI
 import SyncKit
 
 /// The menu the menu bar icon opens: the synced files that changed most
-/// recently, and the way into SyncThing's window.
+/// recently, the way into SyncThing's window, and updates.
 struct StatusMenu: View {
     /// The controller whose state the menu shows.
     let controller: SyncController
+    /// The updater whose updates the menu offers.
+    let updater: Updater
 
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
+        if let version = updater.availableVersion {
+            Button("Update to SyncThing \(version)…", systemImage: "arrow.down.circle", action: updater.checkForUpdates)
+            Divider()
+        }
         if case .unavailable(let reason) = controller.status {
             Text(reason)
             Divider()
@@ -32,6 +38,10 @@ struct StatusMenu: View {
         Divider()
         Button("Open SyncThing", action: openSyncThing)
             .keyboardShortcut("o")
+        if Updater.isEnabled {
+            Button("Check for Updates…", action: updater.checkForUpdates)
+                .disabled(!updater.canCheckForUpdates)
+        }
         Divider()
         Button("Quit SyncThing") { NSApp.terminate(nil) }
             .keyboardShortcut("q")

@@ -84,7 +84,7 @@ Finder and Spotlight keep in folders.
 
 | Path | What |
 |------|------|
-| `SyncThing/` | The app: the menu bar menu (`StatusMenu`), the window (`SyncWindow`), the icons (`AppIcon.icon`, and `AppIconDebug.icon` for Debug), and per-build configuration |
+| `SyncThing/` | The app: the menu bar menu (`StatusMenu`), the window (`SyncWindow`), updates (`Updater`, with Sparkle), the icons (`AppIcon.icon`, and `AppIconDebug.icon` for Debug), and per-build configuration |
 | `Packages/SyncKit/` | Everything else: scanner, engine, store, HTTP server and client, watcher, and `SyncController` |
 
 ## Building
@@ -99,16 +99,35 @@ Run the SyncKit tests with:
 swift test --package-path Packages/SyncKit
 ```
 
-`.symphony/skills/release/scripts/release.sh` builds a notarized Developer
-ID release into `~/Downloads/SyncThing-<version>/`; the `release` skill
-beside it walks through the version bump and commit around it.
+### Releases and updates
+
+Building and publishing are separate steps (the `release` skill in
+`.symphony/skills/release/` walks through both):
+
+- `scripts/release.sh` builds a notarized Developer ID release into
+  `~/Downloads/SyncThing-<version>/` and tags the commit `v<version>`.
+  Nothing leaves the Mac.
+- `scripts/publish.sh <version>` ships it: it signs the zip, adds it to
+  `appcast.xml` with Sparkle's `generate_appcast`, pushes, and creates the
+  GitHub release with both files.
+
+Release builds update themselves with [Sparkle](https://sparkle-project.org)
+from `https://github.com/bunchjesse/sync-thing/releases/latest/download/appcast.xml`,
+checking once a day; the menu offers an update a check found, and the window
+has the automatic-check setting. Sparkle orders builds by
+`CURRENT_PROJECT_VERSION`, so every release raises it. Updates are signed
+with an EdDSA key whose public half is `SUPublicEDKey` in `Info.plist`; the
+private half is the "Private key for signing Sparkle updates" item for
+account `bunch.dev` in the login Keychain. Keep a backup of it
+(`generate_keys --account bunch.dev -x <file>`, from Sparkle's `bin/`):
+without it no installed copy accepts another update.
 
 ### Debug builds
 
 Debug builds are a separate app, `SyncThingDebug.app` (`dev.bunch.SyncThingDebug`),
 with an orange icon bearing a bug and a ladybug beside the menu bar arrows
 (which fill rather than spin while syncing), so it can run next to the copy
-in daily use. They also form a separate sync
+in daily use. They never update themselves. They also form a separate sync
 network: different defaults domain and Keychain access group, Keychain items,
 Bonjour type (`_sync-thing-dbg._tcp` vs `_sync-thing._tcp`), protocol name, and
 relay namespace (`dev.bunch.SyncThing.debug` vs `dev.bunch.SyncThing`).

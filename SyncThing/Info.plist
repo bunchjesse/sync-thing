@@ -12,5 +12,13 @@
 		<string>_sync-thing._tcp</string>
 		<string>_sync-thing-dbg._tcp</string>
 	</array>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/bunchjesse/sync-thing/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>C6YUWfIlMqbtNlnJN553QwFPFeV1/Cd6xqru2E4ykQ0=</string>
+	<key>SUVerifyUpdateBeforeExtraction</key>
+	<true/>
 </dict>
 </plist>

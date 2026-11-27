@@ -1,7 +1,8 @@
 #!/bin/zsh
 # Archives the Release build, notarizes it with Apple through the Xcode
-# account, staples it, verifies it, and copies the app and a zip of it to
-# ~/Downloads/SyncThing-<version>, which it then shows in Finder.
+# account, staples it, verifies it, tags the commit v<version>, and copies
+# the app and a zip of it to ~/Downloads/SyncThing-<version>, which it then
+# shows in Finder. Nothing leaves this Mac; publish.sh ships the build.
 #
 # Usage: release.sh [project-root]
 set -euo pipefail
@@ -18,15 +19,18 @@ fail() { print -u2 "release: $*"; exit 1; }
 settings=$(xcodebuild -showBuildSettings -project $project -scheme $scheme -configuration Release 2>/dev/null)
 setting() { print -r -- "$settings" | awk -v key="$1" '$1 == key && $2 == "=" { print $3; exit }'; }
 version=$(setting MARKETING_VERSION)
+build=$(setting CURRENT_PROJECT_VERSION)
 team=$(setting DEVELOPMENT_TEAM)
-[[ -n $version && -n $team ]] || fail "couldn't read MARKETING_VERSION and DEVELOPMENT_TEAM"
+[[ -n $version && -n $build && -n $team ]] || fail "couldn't read MARKETING_VERSION, CURRENT_PROJECT_VERSION, and DEVELOPMENT_TEAM"
+
+[[ -z $(git ls-remote --tags origin "refs/tags/v$version") ]] || fail "v$version is already published; bump the version"
 
 destination=~/Downloads/SyncThing-$version
 [[ ! -e $destination ]] || fail "$destination already exists; move it away or bump the version"
 
 work=$(mktemp -d /tmp/syncthing-release.XXXXXX)
 archive=$work/SyncThing.xcarchive
-print "release: building $version for team $team in $work"
+print "release: building $version ($build) for team $team in $work"
 
 xcodebuild archive -quiet -project $project -scheme $scheme -configuration Release \
     -destination 'generic/platform=macOS' -archivePath $archive -allowProvisioningUpdates
@@ -74,11 +78,15 @@ signer=$(codesign -dvv $app 2>&1 | awk -F= '$1 == "TeamIdentifier" { print $2 }'
 [[ $signer == $team ]] || fail "signed by team $signer, expected $team"
 built=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" $app/Contents/Info.plist)
 [[ $built == $version ]] || fail "the app says version $built, expected $version"
+built=$(/usr/libexec/PlistBuddy -c "Print CFBundleVersion" $app/Contents/Info.plist)
+[[ $built == $build ]] || fail "the app says build $built, expected $build"
+codesign --verify --deep --strict $app/Contents/Frameworks/Sparkle.framework || fail "Sparkle.framework isn't properly signed"
 
 mkdir -p $destination
 ditto $app $destination/SyncThing.app
-ditto -c -k --keepParent $app $destination/SyncThing-$version.zip
+ditto -c -k --sequesterRsrc --keepParent $app $destination/SyncThing-$version.zip
 rm -rf $work
+git tag -f "v$version" HEAD
 
-print "release: SyncThing $version is in $destination"
+print "release: SyncThing $version ($build) is in $destination, tagged v$version on $(git rev-parse --short HEAD)"
 open -R $destination/SyncThing.app

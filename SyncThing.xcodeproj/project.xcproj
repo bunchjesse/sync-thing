@@ -14,6 +14,12 @@
     {
       "kind": "local",
       "path": "Packages/SyncKit",
+    }, {
+      "kind": "remote",
+      "repository": "https://github.com/sparkle-project/Sparkle",
+      "version": {
+        "up-to-next-major-version": "2.10.1",
+      },
     },
   ],
   "files": [
@@ -52,6 +58,10 @@
       ],
       "package-product-members": [
         {
+          "package": "Sparkle",
+          "product-name": "Sparkle",
+          "build-phase": { "build-phase": "frameworks" },
+        }, {
           "package": "SyncKit",
           "product-name": "SyncKit",
           "build-phase": { "build-phase": "frameworks" },
@@ -72,6 +82,8 @@
         "GENERATE_INFOPLIST_FILE": "YES",
         "INFOPLIST_FILE": "SyncThing/Info.plist",
         "INFOPLIST_KEY_CFBundleDisplayName[config=Debug]": "SyncThingDebug",
+        "INFOPLIST_KEY_CFBundleDisplayName[config=Release]": "SyncThing",
+        "INFOPLIST_KEY_LSApplicationCategoryType": "public.app-category.utilities",
         "INFOPLIST_KEY_LSUIElement": "YES",
         "INFOPLIST_KEY_NSHumanReadableCopyright": "",
         "INFOPLIST_KEY_NSLocalNetworkUsageDescription": "SyncThing finds your other Macs on the local network to keep your files in sync.",
