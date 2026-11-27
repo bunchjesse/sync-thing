@@ -39,18 +39,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-/// The menu bar icon, which spins while files are syncing and shows an
-/// exclamation mark while items wait for the user's choice.
+/// The menu bar icon, which shows an exclamation mark while items wait for
+/// the user's choice and spins while files are syncing. Debug builds show a
+/// ladybug beside the arrows, so they're never mistaken for the copy in
+/// daily use, and fill the arrows instead of spinning them.
 struct MenuBarIcon: View {
     /// The controller whose state the icon shows.
     let controller: SyncController
 
+    #if DEBUG
+    /// The app's name as VoiceOver reads it.
+    private static let appName = "SyncThing Debug"
+    #else
+    /// The app's name as VoiceOver reads it.
+    private static let appName = "SyncThing"
+    #endif
+
     var body: some View {
         let needsChoice = controller.joinQuestion != nil
+        icon(needsChoice: needsChoice)
+            .accessibilityLabel(needsChoice ? "\(Self.appName), needs your choice" : controller.isSyncing ? "\(Self.appName), syncing" : Self.appName)
+    }
+
+    /// The arrows, with the exclamation mark when `needsChoice`.
+    @ViewBuilder private func icon(needsChoice: Bool) -> some View {
+        #if DEBUG
+        let symbol = needsChoice
+            ? "exclamationmark.arrow.triangle.2.circlepath"
+            : controller.isSyncing ? "arrow.triangle.2.circlepath.circle.fill" : "arrow.triangle.2.circlepath"
+        Image(nsImage: Self.debugImage(symbol))
+        #else
         Image(systemName: needsChoice ? "exclamationmark.arrow.triangle.2.circlepath" : "arrow.triangle.2.circlepath")
             .symbolEffect(.rotate, isActive: controller.isSyncing)
-            .accessibilityLabel(needsChoice ? "SyncThing, needs your choice" : controller.isSyncing ? "SyncThing, syncing" : "SyncThing")
+        #endif
     }
+
+    #if DEBUG
+    /// The images ``debugImage(_:)`` drew, by symbol.
+    private static var debugImages: [String: NSImage] = [:]
+
+    /// `symbol` and a ladybug side by side in one template image. A menu
+    /// bar label shows only its first image, so the two can't be separate
+    /// views, and a drawn image can't spin.
+    private static func debugImage(_ symbol: String) -> NSImage {
+        if let image = debugImages[symbol] {
+            return image
+        }
+        let configuration = NSImage.SymbolConfiguration(textStyle: .body, scale: .large)
+        let parts = [symbol, "ladybug.fill"].compactMap {
+            NSImage(systemSymbolName: $0, accessibilityDescription: nil)?.withSymbolConfiguration(configuration)
+        }
+        assert(parts.count == 2, "Missing symbol \(symbol) or ladybug.fill")
+        let spacing: CGFloat = 3
+        let size = NSSize(
+            width: parts.map(\.size.width).reduce(0, +) + spacing * CGFloat(parts.count - 1),
+            height: parts.map(\.size.height).max() ?? 0
+        )
+        let image = NSImage(size: size, flipped: false) { _ in
+            var x: CGFloat = 0
+            for part in parts {
+                part.draw(in: NSRect(x: x, y: (size.height - part.size.height) / 2, width: part.size.width, height: part.size.height))
+                x += part.size.width + spacing
+            }
+            return true
+        }
+        image.isTemplate = true
+        debugImages[symbol] = image
+        return image
+    }
+    #endif
 }
 
 extension SyncConfiguration {

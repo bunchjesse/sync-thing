@@ -8,8 +8,9 @@ the Macs on one Apple Account. See `README.md` for the design.
 - `SyncThing/` — the app target. Keep it thin: `SyncThingApp` (the
   `MenuBarExtra` and the window scene; its `AppDelegate` owns the
   `SyncController`), `StatusMenu` (recent files, Open, Quit), `SyncWindow`
-  (items, Macs, the join question, and options), `AppIcon.icon` (an Icon
-  Composer icon with SVG layers), and `SyncConfiguration.current`.
+  (items, Macs, the join question, and options), `AppIcon.icon` and
+  `AppIconDebug.icon` (Icon Composer icons with SVG layers), and
+  `SyncConfiguration.current`.
 - `Packages/SyncKit/` — all logic, so it can be tested with `swift test`:
   - `SyncLocations`, `SyncModel` — portable paths, timestamps, records, and the
     conflict rules: `VersionVector` orders a path's versions, and
@@ -71,6 +72,14 @@ the Macs on one Apple Account. See `README.md` for the design.
   peers pass the same `admissionProblem(for:)` check as local adds.
 - Debug and Release must stay separate sync networks; don't share Keychain
   prefixes, Bonjour types, or protocol names between them.
+- Debug is also a separate app: `SyncThingDebug.app`, bundle ID
+  `dev.bunch.SyncThingDebug`, the `AppIconDebug` icon, and a ladybug in the
+  menu bar icon. Its settings are `[config=Debug]` variants in
+  `project.xcproj` (with a `[config=Release]` twin each, since an
+  unconditioned value would win), and `PRODUCT_MODULE_NAME` stays
+  `SyncThing` in both. The Keychain access group follows
+  `$(PRODUCT_BUNDLE_IDENTIFIER)`. `AppIconDebug.icon` keeps its own copy of
+  `arrows.svg`; change both icons together.
 - The Bonjour types must stay listed in `NSBonjourServices`.
 - Nothing has shipped yet: change the HTTP API and saved formats freely,
   keep the routes at `/v1`, and don't add migrations or compatibility code
