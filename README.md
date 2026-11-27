@@ -10,9 +10,10 @@ on the local network with Bonjour, and can optionally meet through a
 [rendezvous relay](https://github.com/bunchjesse/rendezvous-relay) when
 they're on different networks.
 
-The menu bar icon lists the ten most recently changed synced files; click one
-to open it, or hold Option to show it in Finder. **Open SyncThing** opens the
-window where you add and remove folders and files, see your other Macs, and
+The menu bar icon's menu says how many of your other Macs it reaches and lists
+the ten most recently changed synced files; click one to open it, or hold
+Option to show it in Finder. **Open SyncThing** opens the window where you add
+and remove folders and files, see your other Macs and sync with them now, and
 set the relay and Open at Login.
 
 ## How it works

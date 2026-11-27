@@ -112,6 +112,15 @@ struct MenuBarIcon: View {
     #endif
 }
 
+#Preview("Menu Bar Icon") {
+    HStack(spacing: 24) {
+        MenuBarIcon(controller: .preview())
+        MenuBarIcon(controller: .preview(peers: [SyncController.PeerState(id: "a", name: "Studio", connection: .connected(.direct), isSyncing: true)]))
+        MenuBarIcon(controller: .preview(joinQuestion: JoinQuestion(items: [JoinQuestion.Item(id: "~/Notes", differingFiles: 3)])))
+    }
+    .padding()
+}
+
 extension SyncConfiguration {
     /// The configuration for this build.
     ///

@@ -93,10 +93,10 @@ public enum SyncError: Error, LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .notFound(let path): "Nothing exists at \(path)."
-        case .tooBroad(let path): "\(path) is too broad to sync. Choose a folder inside it."
-        case .reserved(let path): "\(path) holds SyncThing's own records, so it can't be synced."
+        case .tooBroad(let path): "\(path == "~" ? "Your home folder" : path) is too broad to sync. Choose a folder inside it."
+        case .reserved(let path): "\(path) holds SyncThing’s own records, so it can’t be synced."
         case .insideSyncedItem(let parent): "This is already synced as part of \(parent)."
-        case .containsSyncedItem(let child): "This contains \(child), which is already synced. Remove it first."
+        case .containsSyncedItem(let child): "This contains \(child), which is already synced. Stop syncing it first."
         }
     }
 }

@@ -15,16 +15,20 @@ struct StatusMenu: View {
     var body: some View {
         if let version = updater.availableVersion {
             Button("Update to SyncThing \(version)…", systemImage: "arrow.down.circle", action: updater.checkForUpdates)
+                .labelStyle(.titleAndIcon)
             Divider()
         }
         if case .unavailable(let reason) = controller.status {
-            Text(reason)
-            Divider()
+            Label("SyncThing can’t sync: \(reason)", systemImage: "exclamationmark.triangle")
+                .labelStyle(.titleAndIcon)
+        } else {
+            Text(summary)
         }
         if controller.joinQuestion != nil {
             Button("Choose Which Copies to Keep…", systemImage: "exclamationmark.arrow.triangle.2.circlepath", action: openSyncThing)
-            Divider()
+                .labelStyle(.titleAndIcon)
         }
+        Divider()
         Section("Recently Changed") {
             if controller.recentFiles.isEmpty {
                 Text("No synced files yet")
@@ -45,6 +49,29 @@ struct StatusMenu: View {
         Divider()
         Button("Quit SyncThing") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
+    }
+
+    /// How syncing stands: starting, pulling, no other Macs yet, or which
+    /// of the other Macs this one reaches.
+    private var summary: String {
+        if controller.status == .starting {
+            return "Starting…"
+        }
+        if controller.isSyncing {
+            return "Syncing…"
+        }
+        let peers = controller.peers
+        let connected = peers.filter(\.isConnected)
+        if peers.isEmpty {
+            return "No other Macs yet"
+        }
+        if connected.isEmpty {
+            return "Not connected to your other Macs"
+        }
+        if connected.count == peers.count {
+            return connected.count == 1 ? "Connected to \(connected[0].name)" : "Connected to \(connected.count) Macs"
+        }
+        return "Connected to \(connected.count) of \(peers.count) Macs"
     }
 
     /// Opens SyncThing's window and brings the app forward.
@@ -88,9 +115,14 @@ private struct RecentFileItem: View {
     /// otherwise the date, so it stays right while the menu is open.
     private var detail: String {
         let folder = (file.url.deletingLastPathComponent().path(percentEncoded: false) as NSString).abbreviatingWithTildeInPath
-        let changed = Calendar.current.isDateInToday(file.changed)
-            ? file.changed.formatted(date: .omitted, time: .shortened)
-            : file.changed.formatted(date: .abbreviated, time: .omitted)
+        let calendar = Calendar.current
+        let changed = if calendar.isDateInToday(file.changed) {
+            file.changed.formatted(date: .omitted, time: .shortened)
+        } else if calendar.isDate(file.changed, equalTo: .now, toGranularity: .year) {
+            file.changed.formatted(.dateTime.month(.abbreviated).day())
+        } else {
+            file.changed.formatted(date: .abbreviated, time: .omitted)
+        }
         return "\(folder) · \(changed)"
     }
 }

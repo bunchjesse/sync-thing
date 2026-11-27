@@ -106,6 +106,12 @@ public final class SyncController {
         /// Why the last pull failed, if it did.
         public var lastError: String?
 
+        /// Whether this Mac has a connection to it, directly or through the
+        /// relay.
+        public var isConnected: Bool {
+            if case .connected = connection { true } else { false }
+        }
+
         /// Creates a peer state.
         public init(id: String, name: String, connection: Connection, isSyncing: Bool = false, lastSynced: Date? = nil, lastError: String? = nil) {
             self.id = id
@@ -202,20 +208,44 @@ public final class SyncController {
         return [remote.keychainServicePrefix, remote.localInstance, key].compactMap(\.self).joined(separator: ".")
     }
 
-    private init(previewItems: [ItemState], peers: [PeerState], relayAddress: String?, joinQuestion: JoinQuestion?) {
+    private init(
+        previewStatus: Status,
+        items: [ItemState],
+        peers: [PeerState],
+        relayAddress: String?,
+        relayStatus: RemoteNode.RelayStatus?,
+        joinQuestion: JoinQuestion?
+    ) {
         self.configuration = nil
         self.defaults = .standard
-        self.status = .running
-        self.items = previewItems
+        self.status = previewStatus
+        self.items = items
         self.peers = peers
         self.relayAddress = relayAddress
-        self.relayStatus = relayAddress == nil ? .off : .registered
+        self.relayStatus = relayStatus ?? (relayAddress == nil ? .off : .registered)
         self.joinQuestion = joinQuestion
     }
 
     /// A controller showing fixed state that never syncs, for previews.
-    public static func preview(items: [ItemState], peers: [PeerState], relayAddress: String? = nil, joinQuestion: JoinQuestion? = nil) -> SyncController {
-        SyncController(previewItems: items, peers: peers, relayAddress: relayAddress, joinQuestion: joinQuestion)
+    ///
+    /// When `relayStatus` is nil, the relay shows as registered if
+    /// `relayAddress` is set and off otherwise.
+    public static func preview(
+        status: Status = .running,
+        items: [ItemState] = [],
+        peers: [PeerState] = [],
+        relayAddress: String? = nil,
+        relayStatus: RemoteNode.RelayStatus? = nil,
+        joinQuestion: JoinQuestion? = nil
+    ) -> SyncController {
+        SyncController(
+            previewStatus: status,
+            items: items,
+            peers: peers,
+            relayAddress: relayAddress,
+            relayStatus: relayStatus,
+            joinQuestion: joinQuestion
+        )
     }
 
     // MARK: - Lifecycle
@@ -721,7 +751,7 @@ final class PeerSession {
         do {
             let report = try await engine.pull(from: peer)
             state.lastSynced = .now
-            state.lastError = report.failed == 0 ? nil : "\(report.failed) \(report.failed == 1 ? "file" : "files") couldn't sync; retrying."
+            state.lastError = report.failed == 0 ? nil : "\(report.failed) \(report.failed == 1 ? "file" : "files") couldn’t sync; retrying."
         } catch is CancellationError {
         } catch {
             Self.log.info("Couldn't pull from \(self.state.name, privacy: .private): \(error.localizedDescription, privacy: .public)")

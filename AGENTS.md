@@ -7,9 +7,10 @@ the Macs on one Apple Account. See `README.md` for the design.
 
 - `SyncThing/` — the app target. Keep it thin: `SyncThingApp` (the
   `MenuBarExtra` and the window scene; its `AppDelegate` owns the
-  `SyncController` and the `Updater`), `StatusMenu` (recent files, Open,
-  Check for Updates, Quit), `SyncWindow` (items, Macs, the join question,
-  options, and updates), `Updater` (Sparkle's `SPUStandardUpdaterController`
+  `SyncController` and the `Updater`), `StatusMenu` (a status line, recent
+  files, Open, Check for Updates, Quit), `SyncWindow` (items, Macs and Sync
+  Now, the join question, options, and updates), `Updater` (Sparkle's
+  `SPUStandardUpdaterController`
   with gentle reminders, since the app has no Dock icon), `AppIcon.icon` and
   `AppIconDebug.icon` (Icon Composer icons with SVG layers), and
   `SyncConfiguration.current`.
