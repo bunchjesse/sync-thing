@@ -183,6 +183,7 @@ public final class SyncController {
     @ObservationIgnored private var identity: DeviceIdentity?
     @ObservationIgnored private var node: RemoteNode?
     @ObservationIgnored private var registry: DeviceRegistry?
+    @ObservationIgnored private var trustedHosts: TrustedHosts?
     @ObservationIgnored private var sessions: [String: PeerSession] = [:]
     @ObservationIgnored private var tasks: [Task<Void, Never>] = []
     @ObservationIgnored private var pendingAnnounce: Task<Void, Never>?
@@ -286,6 +287,7 @@ public final class SyncController {
 
             let registry = DeviceRegistry(store: store, configuration: remote)
             self.registry = registry
+            trustedHosts = TrustedHosts(store: store, configuration: remote)
             let portKey = Self.defaultsKey(Self.listeningPortKey, for: configuration)
             let storedPort = UInt16(exactly: defaults.integer(forKey: portKey)).flatMap { $0 == 0 ? nil : $0 }
             let node = try await RemoteNode.start(identity: identity, configuration: remote, acceptingDevicesIn: registry, preferredPort: storedPort)
@@ -320,6 +322,7 @@ public final class SyncController {
         server = nil
         node = nil
         registry = nil
+        trustedHosts = nil
         engine = nil
     }
 
@@ -389,15 +392,18 @@ public final class SyncController {
     /// Re-reads the registry: links to Macs that joined, drops ones that
     /// left, and hands record changes to the links.
     private func refreshPeers() async {
-        guard let identity, let node, let engine, let registry else { return }
-        let records: [DeviceRecord]
+        guard let identity, let node, let engine, let registry, let trustedHosts else { return }
+        let hosts: [DeviceRecord]
         do {
-            records = try await Self.offMain { try registry.records() }
+            hosts = try await Self.offMain {
+                let hosts = try registry.records().filter { $0.endpointID != identity.endpointID && $0.canHost && $0.platform == .macOS }
+                try Self.trustAccountMacs(hosts, in: trustedHosts, revocations: registry.revocations())
+                return hosts
+            }
         } catch {
             Self.log.error("Couldn't read the device registry: \(error.localizedDescription, privacy: .public)")
             return
         }
-        let hosts = records.filter { $0.endpointID != identity.endpointID && $0.canHost && $0.platform == .macOS }
         let ids = Set(hosts.map(\.endpointID))
         for (id, session) in sessions where !ids.contains(id) {
             session.stop()
@@ -407,7 +413,7 @@ public final class SyncController {
             if let session = sessions[record.endpointID] {
                 session.update(record: record)
             } else {
-                let session = PeerSession(record: record, node: node, engine: engine) { [weak self] in
+                let session = PeerSession(record: record, node: node, trustedHosts: trustedHosts, engine: engine) { [weak self] in
                     self?.publishPeers()
                 }
                 sessions[record.endpointID] = session
@@ -415,6 +421,16 @@ public final class SyncController {
             }
         }
         publishPeers()
+    }
+
+    /// Distrusts every revoked Mac for good, then trusts each of `hosts`
+    /// this Mac hasn't decided about, since every Mac on the account is
+    /// trusted. A Mac distrusted once stays distrusted.
+    private nonisolated static func trustAccountMacs(_ hosts: [DeviceRecord], in trustedHosts: TrustedHosts, revocations: [DeviceRevocation]) throws {
+        try trustedHosts.applyRevocations(revocations)
+        for host in hosts where try trustedHosts.decision(for: host.endpointID) == nil {
+            try trustedHosts.trust(host)
+        }
     }
 
     private func publishPeers() {
@@ -605,6 +621,7 @@ public final class SyncController {
         }
         let record = DeviceRecord(
             endpointID: identity.endpointID,
+            gateKey: identity.gateKey,
             name: configuration.deviceName,
             platform: .macOS,
             canHost: true,
@@ -652,12 +669,12 @@ final class PeerSession {
     private let pullRequests: AsyncStream<Void>.Continuation
     private var loop: Task<Void, Never>?
 
-    init(record: DeviceRecord, node: RemoteNode, engine: SyncEngine, onChange: @escaping @MainActor () -> Void) {
+    init(record: DeviceRecord, node: RemoteNode, trustedHosts: TrustedHosts, engine: SyncEngine, onChange: @escaping @MainActor () -> Void) {
         self.engine = engine
         self.onChange = onChange
         self.state = .init(id: record.endpointID, name: record.name, connection: .connecting)
         (pulls, pullRequests) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
-        self.link = RemoteHostLink(node: node, host: record) { [weak self] linkState in
+        self.link = RemoteHostLink(node: node, host: record, trustedHosts: trustedHosts) { [weak self] linkState in
             await self?.linkChanged(linkState)
         }
     }
@@ -737,6 +754,9 @@ final class PeerSession {
         case .denied:
             peer = nil
             state.connection = .unreachable("\(state.name) refused this Mac.")
+        case .untrustedHost:
+            peer = nil
+            state.connection = .unreachable("This Mac no longer trusts \(state.name).")
         case .unavailable(let reason), .unreachable(let reason):
             peer = nil
             state.connection = .unreachable(reason)

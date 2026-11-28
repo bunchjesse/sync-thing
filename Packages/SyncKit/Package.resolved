@@ -1,5 +1,5 @@
 {
-  "originHash" : "c01dfbad3fbc49d960d45c970e12b984138aba8f289c3a1e88411544c6fbc650",
+  "originHash" : "193010c0ea4dae7ff3057b1ddef4b17ea1fe62a67503e72b191dbf040d39e5d0",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/bunchjesse/device-tunnel.git",
       "state" : {
-        "revision" : "9707ab86a7131a8f25d25cb03bb782f43a526f50",
-        "version" : "0.1.0"
+        "revision" : "1ea2462e4f41c55110a2b120e050275de0c0c659",
+        "version" : "0.2.0"
       }
     },
     {

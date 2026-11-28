@@ -22,7 +22,8 @@ set the relay and Open at Login.
   [device-tunnel](https://github.com/bunchjesse/device-tunnel). Each Mac has
   an Ed25519 identity and publishes a record in an iCloud Keychain synced
   registry. Any Mac in that registry — that is, signed in to the same Apple
-  Account — is trusted automatically.
+  Account — is trusted automatically, both as a host and as one to pull
+  from, until it's revoked on the account; a revoked Mac stays shut out.
 - **Transport**: each Mac runs a small HTTP server on `127.0.0.1` (Hummingbird).
   Other Macs reach it only through an SSH tunnel, with a bearer token issued
   per Mac when its tunnel is admitted.

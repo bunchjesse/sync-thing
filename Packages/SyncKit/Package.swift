@@ -10,7 +10,7 @@ let package = Package(
         .library(name: "SyncKit", targets: ["SyncKit"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/bunchjesse/device-tunnel.git", .upToNextMinor(from: "0.1.0")),
+        .package(url: "https://github.com/bunchjesse/device-tunnel.git", .upToNextMinor(from: "0.2.0")),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.29.0", traits: []),
     ],
     targets: [

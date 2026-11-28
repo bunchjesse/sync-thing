@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/bunchjesse/device-tunnel.git",
       "state" : {
-        "revision" : "9707ab86a7131a8f25d25cb03bb782f43a526f50",
-        "version" : "0.1.0"
+        "revision" : "1ea2462e4f41c55110a2b120e050275de0c0c659",
+        "version" : "0.2.0"
       }
     },
     {
