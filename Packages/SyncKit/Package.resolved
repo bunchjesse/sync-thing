@@ -33,8 +33,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/bunchjesse/rendezvous-relay.git",
       "state" : {
-        "revision" : "91a5c1f1476ad88acfc3fb21bf1621ee563d1182",
-        "version" : "0.1.1"
+        "revision" : "aeacd438166da6376c001d221f225de0c69e1628",
+        "version" : "0.1.2"
       }
     },
     {
